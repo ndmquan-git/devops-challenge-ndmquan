@@ -24,7 +24,7 @@ Two pipelines, one per application. `p4-backend` builds the Express API into a c
 
 ### Out of scope
 
-- **The rest of the AWS estate**: VPC, subnets, the ALB and target group, the instances, the bucket and the distribution. They are inputs to the Terraform module and assumptions below.
+- **The rest of the AWS estate**: VPC, subnets, the ALB and target group, the instances, the bucket and the distribution. They are inputs to the Terraform module, and the assumptions state what they must provide.
 - **Application features**: the API serves `/healthz`, `/api/version` and `/api/items`; the SPA shows the API version. Both exist to give the pipelines something real to ship.
 - **A database**: the API has none, so there is no migration step.
 
@@ -101,7 +101,7 @@ same build`"]
 |---|---|---|
 | Pull request touching the app | CI, the `deploy.sh` test, image build and scan; nothing is published or deployed | CI and build |
 | Push to `main` | CI, image published as `<registry>/p4-backend@sha256:<digest>`, signed and attested, staging, then production | CI, build uploaded as artifact `frontend-dist`, staging, then production |
-| Manual run with `image` or `artifact-run-id` | Skips the build and redeploys that digest after validating it; see [Rollback](#rollback) | Skips the build and redeploys that run's artifact after validating the run |
+| Manual run with `image` or `artifact-run-id` | Skips the build and redeploys that digest after checking its form and registry | Skips the build and redeploys that run's artifact after validating the run |
 
 The image moves through three jobs with different rights. `build` has no credentials: it lints the Dockerfile, builds, scans with Trivy and saves the image as a run artifact. `publish` has `packages: write`, `id-token: write` and `attestations: write`, but runs no application code: it loads the artifact, pushes it, reads the digest, signs it with a keyless certificate bound to the `_container.yml` workflow on `main`, and attests build provenance. The registry is ECR when the `ECR_REGISTRY` and `AWS_ECR_ROLE_ARN` variables are set, otherwise this repository's GHCR namespace, so the publish path is exercised on every push to `main` even with no AWS account.
 
@@ -136,13 +136,13 @@ Inside `_deploy-s3.yml`, `publish.sh` records the live `index.html` version, the
 
 | # | Decision | Alternatives considered | Why | Revisit when |
 |---|---|---|---|---|
-| 1 | SSM Run Command replaces the container on long-lived instances | AWS CodeDeploy; Ansible; see the comparison below | The service is released by hand today, so the smallest step that adds safety wins: no agent to install beyond the one in the AMI, no inbound port, audited in CloudTrail | The fleet moves into an Auto Scaling group that needs blue/green or alarm-based rollback (CodeDeploy); hosts need configuration management (Ansible); the API moves to EKS with a GitOps controller or to ECS, where a deploy is a manifest or task-definition change and both scripts retire |
+| 1 | SSM Run Command replaces the container on long-lived instances | AWS CodeDeploy; Ansible | The service is released by hand today, so the smallest step that adds safety wins: no agent to install beyond the one in the AMI, no inbound port, audited in CloudTrail | The fleet moves into an Auto Scaling group that needs blue/green or alarm-based rollback (CodeDeploy); hosts need configuration management (Ansible); the API moves to EKS with a GitOps controller or to ECS, where a deploy is a manifest or task-definition change and both scripts retire |
 | 2 | Deploy by digest, never by tag | Immutable tags only | A digest names one set of bytes; a tag is a pointer that a registry setting protects. The signature and the attestation are bound to the digest as well | Never; a tag remains for humans to read |
 | 3 | Keyless signing and build-provenance attestation, verified before every deploy | No signing; key-based signing with a KMS key | Keyless binds the signature to the workflow identity with nothing to rotate or leak; provenance says which commit and workflow built the image | A private Sigstore deployment or an air-gapped fleet, where key-based signing with offline verification fits better |
 | 4 | Build and publish are separate jobs | One job that builds and pushes | The job that runs the build, and so any third-party build step, holds no registry or cloud credential; the job that holds them runs nothing but push, sign and attest | Never |
 | 5 | GHCR when ECR is not configured | Skip publishing without AWS | The publish, signature and verification path runs for real on every push to `main`, so a broken step shows up here and not on the first real release | An AWS account is wired: set the two variables and the same workflow publishes to ECR |
 | 6 | GitHub environments gate promotion | A marker file in S3 written by staging; a separate release workflow | Environments give required reviewers, branch policies and per-environment variables with no extra moving part | A compliance need for a signed promotion record, when a promotion attestation written by the staging job becomes a second gate |
-| 7 | The runner drains and re-registers instances; the instance deploys and rolls itself back | Rollback driven from the runner | The instance already knows its previous image and can restore it even if the runner loses contact; the runner needs only the ALB and SSM calls | The ASG path in decision 1 |
+| 7 | The runner drains and re-registers instances; the instance deploys and rolls itself back | Rollback driven from the runner | The instance already knows its previous image and can restore it even if the runner loses contact; the runner needs only the ALB and SSM calls | The fleet moves into an Auto Scaling group, where instance refresh replaces in-place deploys |
 | 8 | Frontend rollback restores the previous `index.html` version | Re-run the previous build; keep a copy under another key | S3 versioning already keeps every `index.html`; a copy plus one invalidation is the whole rollback and needs no artifact | Never while the bucket is versioned |
 | 9 | Smoke tests check the served revision, not only a 200 | Health endpoint only | A 200 from an old container is the failure these pipelines exist to catch | Never |
 | 10 | IAM as Terraform, with trust pinned to the repository, the branch or environment, and the calling workflow file | Prose documentation; hand-written JSON | The policies are reviewable, validated in CI and applied the same way each time. IAM evaluates only a few OIDC claims, so the repository's subject claim is customised to include `job_workflow_ref` and each trust policy matches the full subject; another workflow in the same repository then cannot assume a deploy role | The rest of the estate moves into Terraform, when this module joins it |
@@ -169,7 +169,7 @@ The deploy mechanism, judged against today's conditions (a manual release proces
 
 ## Connecting a real AWS account
 
-Apply the Terraform in [`infra/`](infra/) once per account, after setting the repository's OIDC subject claim to include `job_workflow_ref` as its README shows; its outputs are the values below. Nothing in them is secret. The first run after `AWS_DEPLOY_ROLE_ARN` is set leaves dry-run mode; the first run after `ECR_REGISTRY` and `AWS_ECR_ROLE_ARN` are set publishes to ECR instead of GHCR.
+Apply the Terraform in [`infra/`](infra/) once per account, after setting the repository's OIDC subject claim to include `job_workflow_ref` as its README shows; its outputs are the variables this table lists. Nothing in them is secret. The first run after `AWS_DEPLOY_ROLE_ARN` is set leaves dry-run mode; the first run after `ECR_REGISTRY` and `AWS_ECR_ROLE_ARN` are set publishes to ECR instead of GHCR.
 
 | Variable | Scope | Value |
 |---|---|---|

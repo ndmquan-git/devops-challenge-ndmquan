@@ -91,16 +91,16 @@ docker compose up --build --wait
 
 The role init script runs only on an empty `pgdata` volume; after changing `APP_DB_USER` or `APP_DB_PASSWORD`, run `docker compose down -v` first.
 
-| Check | What it proves | Fault |
+| Check | What it proves | Root cause it covers |
 |---|---|---|
-| `/` and `/api/users` return 200 through nginx | nginx reaches the API on the right port | 1 |
-| `/status` and `/ready` return 200 through nginx | Both health endpoints are routed | 11 |
-| 500 requests at concurrency 50 all return 200 | A pool of 10 queues 50 clients without errors: capacity, not the leak | 4 (sizing) |
-| [`tests/pool-leak.js`](tests/pool-leak.js), run inside the API image against the stack's Postgres | `connect()` plus a throwing query and no `release()` exhausts a pool of 2 after two failures, and `SELECT 1` times out; `pool.query()` on the same query leaves the pool usable after ten | 4 (leak) |
-| `/api/users` returns 200 within 5 s while Redis is stopped | Redis stays off the request path | 5 |
-| After a Postgres restart the API answers again; its restart count is unchanged | The process survives a dropped connection | 3 (crash) |
-| `docker compose stop -t 10 api` exits 0 within the grace period; the API serves again after `start` | `SIGTERM` reaches Node and the shutdown drains | 3 (shutdown) |
-| After the API is recreated on a new IP, nginx routes to it without a reload | The upstream is re-resolved | 2 |
+| `/` and `/api/users` return 200 through nginx | nginx reaches the API on the right port | nginx proxying to the wrong port |
+| `/status` and `/ready` return 200 through nginx | Both health endpoints are routed | Health endpoints not routed through nginx |
+| 500 requests at concurrency 50 all return 200 | A pool of 10 queues 50 clients without errors: capacity, not the leak | Pool sizing and the acquire timeout |
+| [`tests/pool-leak.js`](tests/pool-leak.js), run inside the API image against the stack's Postgres | `connect()` plus a throwing query and no `release()` exhausts a pool of 2 after two failures, and `SELECT 1` times out; `pool.query()` on the same query leaves the pool usable after ten | Connection leak on a failed query |
+| `/api/users` returns 200 within 5 s while Redis is stopped | Redis stays off the request path | Redis awaited on the request path |
+| After a Postgres restart the API answers again; its restart count is unchanged | The process survives a dropped connection | Crash on a dropped pool connection |
+| `docker compose stop -t 10 api` exits 0 within the grace period; the API serves again after `start` | `SIGTERM` reaches Node and the shutdown drains | Signals not reaching Node |
+| After the API is recreated on a new IP, nginx routes to it without a reload | The upstream is re-resolved | nginx caching the API's address |
 
 The suite fails against the original stack: the first check gets 502. The other faults are configuration: `docker compose config --quiet`, `nginx -t`, hadolint and Trivy run in CI, and `SELECT rolsuper FROM pg_roles WHERE rolname = 'app'` returns `f`. [`api/test/app.test.js`](api/test/app.test.js) covers the handler's failure paths.
 
