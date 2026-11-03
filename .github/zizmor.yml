@@ -1,0 +1,13 @@
+# Same-repository workflow calls use `./.github/workflows/...` rather than the
+# `$/` form zizmor prefers, because actionlint 1.7.12 rejects `$/`; both forms
+# resolve to the caller's own commit.
+rules:
+  self-repository:
+    ignore:
+      - p1-ci.yml
+      - p2-ci.yml
+      - p3-ci.yml
+      - p4-backend.yml
+      - p4-docs.yml
+      - p4-frontend.yml
+      - p5-ci.yml

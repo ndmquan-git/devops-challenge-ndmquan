@@ -1,0 +1,27 @@
+name: p4-docs
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - src/problem4/**/*.md
+      - src/problem4/**/*.sh
+      - .github/workflows/p4-docs.yml
+      - .github/workflows/_docs.yml
+      - .markdownlint-cli2.jsonc
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_docs.yml
+    with:
+      path: src/problem4

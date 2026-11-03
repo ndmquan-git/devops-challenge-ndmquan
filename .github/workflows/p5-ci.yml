@@ -1,0 +1,26 @@
+name: p5-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - src/problem5/**
+      - .github/workflows/p5-ci.yml
+      - .github/workflows/_docs.yml
+      - .markdownlint-cli2.jsonc
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_docs.yml
+    with:
+      path: src/problem5

@@ -1,0 +1,127 @@
+name: deploy-s3
+
+# Settings come from GitHub environment variables (AWS_DEPLOY_ROLE_ARN,
+# FRONTEND_BUCKET, CLOUDFRONT_DISTRIBUTION_ID, FRONTEND_URL). Without
+# AWS_DEPLOY_ROLE_ARN the publish runs as a dry run. A failed smoke test puts
+# the previous index.html version back.
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      artifact-name:
+        required: false
+        type: string
+        default: frontend-dist
+      artifact-run-id:
+        description: Run that produced the artifact; empty means this run
+        required: false
+        type: string
+        default: ""
+      source-workflow:
+        description: Workflow file a foreign artifact run must come from
+        required: false
+        type: string
+        default: .github/workflows/p4-frontend.yml
+      publish-script:
+        required: false
+        type: string
+        default: src/problem4/frontend/deploy/publish.sh
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: ${{ inputs.environment }}
+    concurrency:
+      group: deploy-frontend-${{ inputs.environment }}
+      cancel-in-progress: false
+    env:
+      DRY_RUN: ${{ vars.AWS_DEPLOY_ROLE_ARN == '' && '1' || '0' }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check the artifact's source run
+        if: inputs.artifact-run-id != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ inputs.artifact-run-id }}
+          SOURCE: ${{ inputs.source-workflow }}
+        run: |
+          [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::artifact-run-id must be numeric"; exit 1; }
+          read -r event branch conclusion path < <(gh api "repos/$REPO/actions/runs/$RUN_ID" \
+            --jq '[.event, .head_branch, .conclusion, .path] | @tsv')
+          [ "$event $branch $conclusion $path" = "push main success $SOURCE" ] \
+            || { echo "::error::run $RUN_ID is $event on $branch ($conclusion) from $path; only successful pushes to main from $SOURCE can be redeployed"; exit 1; }
+
+      - name: Download the build
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: dist
+          run-id: ${{ inputs.artifact-run-id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Assume the deploy role
+        if: env.DRY_RUN == '0'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+
+      - name: Publish
+        id: publish
+        env:
+          DIST_DIR: dist
+          ENV_NAME: ${{ inputs.environment }}
+          BUCKET: ${{ vars.FRONTEND_BUCKET || '<bucket>' }}
+          DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID || '<distribution-id>' }}
+          SCRIPT: ${{ inputs.publish-script }}
+        run: PUBLISH_STATE="$GITHUB_OUTPUT" "$SCRIPT" 2>&1 | tee publish.log
+
+      - name: Smoke test
+        id: smoke
+        if: env.DRY_RUN == '0'
+        env:
+          URL: ${{ vars.FRONTEND_URL }}
+          ENV_NAME: ${{ inputs.environment }}
+        run: |
+          curl -fsS --retry 5 --retry-all-errors "$URL/config.json" | grep -q "\"$ENV_NAME\""
+          curl -fsS "$URL/index.html" -o index.html
+          grep -oE '(src|href)="/[^"]+"' index.html | cut -d'"' -f2 | sort -u | while read -r asset; do
+            curl -fsS -o /dev/null "$URL$asset" || { echo "::error::asset $asset is not served"; exit 1; }
+          done
+
+      - name: Restore the previous index.html
+        if: failure() && steps.smoke.conclusion == 'failure' && steps.publish.outputs.previous_index_version != ''
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          BUCKET: ${{ vars.FRONTEND_BUCKET }}
+          DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+          SCRIPT: ${{ inputs.publish-script }}
+          PREVIOUS: ${{ steps.publish.outputs.previous_index_version }}
+        run: '"$SCRIPT" --restore "$PREVIOUS" 2>&1 | tee -a publish.log'
+
+      - name: Summary
+        if: always()
+        env:
+          ENV_NAME: ${{ inputs.environment }}
+          SOURCE_RUN: ${{ inputs.artifact-run-id || github.run_id }}
+        run: |
+          {
+            echo "### Frontend → $ENV_NAME"
+            echo "Artifact from run $SOURCE_RUN"
+            if [ "$DRY_RUN" = 1 ]; then echo "Dry run: AWS_DEPLOY_ROLE_ARN is not set for this environment."; fi
+            echo '```text'
+            cat publish.log 2>/dev/null || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

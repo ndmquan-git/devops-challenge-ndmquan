@@ -1,0 +1,40 @@
+name: p2-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - src/problem2/**
+      - .github/workflows/p2-ci.yml
+      - .github/workflows/_docs.yml
+      - src/problem2/tests/**
+      - .markdownlint-cli2.jsonc
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_docs.yml
+    with:
+      path: src/problem2
+
+  rotation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Prove log rotation makes NGINX reopen its logs
+        run: src/problem2/tests/rotate-check.sh

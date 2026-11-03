@@ -1,0 +1,43 @@
+name: docs
+
+on:
+  workflow_call:
+    inputs:
+      path:
+        description: Directory whose Markdown and shell scripts are checked
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Markdown lint
+        uses: DavidAnson/markdownlint-cli2-action@696eb3f2509270d7b882d2aa68347bc676e7af34 # v25.0.0
+        with:
+          globs: ${{ inputs.path }}/**/*.md
+
+      - name: Local link check
+        uses: lycheeverse/lychee-action@e7477775783ea5526144ba13e8db5eec57747ce8 # v2.9.0
+        with:
+          args: --offline --include-fragments --no-progress '${{ inputs.path }}/**/*.md'
+          fail: true
+          failIfEmpty: false
+          jobSummary: false
+
+      - name: Shellcheck
+        env:
+          TARGET: ${{ inputs.path }}
+        run: find "$TARGET" -name '*.sh' -not -path '*/node_modules/*' -print0 | xargs -0 -r shellcheck

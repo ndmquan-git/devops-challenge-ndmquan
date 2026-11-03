@@ -1,0 +1,63 @@
+name: p4-frontend
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - src/problem4/frontend/**
+      - .github/workflows/p4-frontend.yml
+      - .github/workflows/_node.yml
+      - .github/workflows/_deploy-s3.yml
+  workflow_dispatch:
+    inputs:
+      artifact-run-id:
+        description: Run whose build to redeploy (rollback). Empty builds and deploys this commit.
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  ci:
+    if: github.event_name != 'workflow_dispatch' || inputs.artifact-run-id == ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_node.yml
+    with:
+      working-directory: src/problem4/frontend
+      build: true
+      artifact-name: frontend-dist
+
+  deploy-staging:
+    needs: ci
+    if: >-
+      !cancelled() && !failure()
+      && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-s3.yml
+    with:
+      environment: staging
+      artifact-run-id: ${{ inputs.artifact-run-id }}
+
+  deploy-production:
+    needs: deploy-staging
+    if: >-
+      !cancelled() && !failure()
+      && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-s3.yml
+    with:
+      environment: production
+      artifact-run-id: ${{ inputs.artifact-run-id }}

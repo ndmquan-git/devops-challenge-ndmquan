@@ -1,0 +1,118 @@
+name: p4-backend
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - src/problem4/backend/**
+      - .github/workflows/p4-backend.yml
+      - .github/workflows/_node.yml
+      - .github/workflows/_container.yml
+      - .github/workflows/_deploy-ec2.yml
+  workflow_dispatch:
+    inputs:
+      image:
+        description: Digest reference to redeploy (rollback). Empty builds and deploys this commit.
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  ci:
+    if: github.event_name != 'workflow_dispatch' || inputs.image == ''
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_node.yml
+    with:
+      working-directory: src/problem4/backend
+
+  deploy-script:
+    if: github.event_name != 'workflow_dispatch' || inputs.image == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Deploy a healthy image, then a broken one
+        run: src/problem4/backend/deploy/test-deploy.sh
+
+  image:
+    needs: [ci, deploy-script]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_container.yml
+    with:
+      context: src/problem4/backend
+      image-name: p4-backend
+      push: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
+      build-args: APP_VERSION=${{ github.sha }}
+
+  rollback-input:
+    if: github.event_name == 'workflow_dispatch' && inputs.image != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      image: ${{ steps.check.outputs.image }}
+    steps:
+      - name: Accept only a digest from a registry this repository publishes to
+        id: check
+        env:
+          IMAGE: ${{ inputs.image }}
+          ECR_REGISTRY: ${{ vars.ECR_REGISTRY }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          [[ "$IMAGE" =~ ^([a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)*)/p4-backend@sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::expected <registry>/p4-backend@sha256:<digest>"; exit 1; }
+          registry="${BASH_REMATCH[1]}"
+          [ "$registry" = "ghcr.io/${OWNER,,}" ] || { [ -n "$ECR_REGISTRY" ] && [ "$registry" = "$ECR_REGISTRY" ]; } \
+            || { echo "::error::registry $registry is not one this repository publishes to"; exit 1; }
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  deploy-staging:
+    needs: [image, rollback-input]
+    if: >-
+      !cancelled() && !failure()
+      && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-ec2.yml
+    with:
+      environment: staging
+      image: ${{ needs.rollback-input.outputs.image || needs.image.outputs.image }}
+
+  deploy-production:
+    needs: [image, rollback-input, deploy-staging]
+    if: >-
+      !cancelled() && !failure()
+      && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: read
+      attestations: read
+      id-token: write
+    uses: ./.github/workflows/_deploy-ec2.yml
+    with:
+      environment: production
+      image: ${{ needs.rollback-input.outputs.image || needs.image.outputs.image }}

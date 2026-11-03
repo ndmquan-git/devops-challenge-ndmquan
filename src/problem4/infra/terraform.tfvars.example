@@ -1,0 +1,27 @@
+# Example values only: 123456789012 is not a real account and every name is a placeholder.
+github_owner = "example-owner"
+github_repo  = "example-repo"
+
+# Required for a repository created after 2026-07-15 or opted in to immutable subject
+# claims (`gh api repos/<owner>/<repo> --jq '{owner_id: .owner.id, repo_id: .id}'`).
+# Leave both null for a repository that still emits the name-only format.
+github_owner_id = 123456
+github_repo_id  = 456789
+
+aws_region            = "us-east-1"
+app_tag               = "p4-backend"
+ecr_repository_name   = "p4-backend"
+create_ecr_repository = true
+
+environments = {
+  staging = {
+    target_group_arn           = "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/example-staging/0123456789abcdef"
+    frontend_bucket            = "example-frontend-staging"
+    cloudfront_distribution_id = "E1EXAMPLESTAGIN"
+  }
+  production = {
+    target_group_arn           = "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/example-production/0123456789abcdef"
+    frontend_bucket            = "example-frontend-production"
+    cloudfront_distribution_id = "E1EXAMPLEPROD00"
+  }
+}

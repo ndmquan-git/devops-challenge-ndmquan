@@ -1,0 +1,90 @@
+name: p3-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - src/problem3/**
+      - .github/workflows/p3-ci.yml
+      - .github/workflows/_docs.yml
+      - .github/workflows/_node.yml
+      - .github/workflows/_container.yml
+      - .markdownlint-cli2.jsonc
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  docs:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_docs.yml
+    with:
+      path: src/problem3
+
+  api:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_node.yml
+    with:
+      working-directory: src/problem3/api
+
+  image:
+    permissions:
+      contents: read
+    uses: ./.github/workflows/_container.yml
+    with:
+      context: src/problem3/api
+      image-name: p3-api
+
+  stack:
+    permissions:
+      contents: read
+    needs: [api, image]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: src/problem3
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Generate database passwords
+        run: |
+          for var in POSTGRES_PASSWORD APP_DB_PASSWORD; do
+            password=$(openssl rand -base64 20)
+            echo "::add-mask::$password"
+            echo "$var=$password" >> "$GITHUB_ENV"
+          done
+
+      - name: Validate Compose and nginx config
+        run: |
+          docker compose config --quiet
+          docker compose run --rm --no-deps nginx nginx -t
+
+      - name: Start stack
+        run: docker compose up --build --wait --wait-timeout 180
+
+      - name: Smoke and fault tests
+        run: ./tests/smoke.sh
+
+      - name: Diagnostics
+        if: failure()
+        run: |
+          docker compose ps -a
+          docker compose logs --no-color
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v

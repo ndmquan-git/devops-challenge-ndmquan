@@ -1,0 +1,9 @@
+{
+  "config": {
+    // Prose paragraphs are not hard-wrapped.
+    "MD013": false,
+    // Tables use the compact |---| delimiter row.
+    "MD060": false
+  },
+  "ignores": ["**/node_modules/**"]
+}
