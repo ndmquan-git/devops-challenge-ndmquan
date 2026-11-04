@@ -13,4 +13,5 @@ COPY src ./src
 
 USER 1000
 EXPOSE 3000
+HEALTHCHECK --interval=10s --timeout=3s --start-period=10s --retries=3 CMD ["wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/status"]
 CMD ["node", "src/index.js"]
