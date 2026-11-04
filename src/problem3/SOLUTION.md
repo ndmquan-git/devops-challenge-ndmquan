@@ -1,6 +1,6 @@
 # Problem 3: Debugging issues within system
 
-Every `/api/*` call through nginx failed because nginx proxied to the wrong port. Behind it, a Postgres restart crashed the API, a Redis outage failed every request, nginx kept a stale API address, and a database error leaked pool connections. The stack also had eight hardening gaps: no query timeout, health endpoints that nginx did not route, startup that ignored dependency health, no memory limits and a port open on every interface, a superuser database login, a hardcoded password, an end-of-life base image running as root, and config files that were never mounted. [`tests/smoke.sh`](tests/smoke.sh) runs each failure scenario in [CI](../../.github/workflows/p3-ci.yml), together with checks for five of the hardening gaps.
+Every `/api/*` call through nginx failed because nginx proxied to the wrong port. Behind it, a Postgres restart crashed the API, a Redis outage failed every request, nginx kept a stale API address, and a database error leaked pool connections. The stack also had nine hardening gaps: no rate limiting, no query timeout, health endpoints that nginx did not route, startup that ignored dependency health, no memory limits and a port open on every interface, a superuser database login, a hardcoded password, an end-of-life base image running as root, and config files that were never mounted. [`tests/smoke.sh`](tests/smoke.sh) runs each failure scenario in [CI](../../.github/workflows/p3-ci.yml), together with checks for six of the hardening gaps.
 
 ## Contents
 
@@ -47,6 +47,7 @@ Every `/api/*` call through nginx failed because nginx proxied to the wrong port
 | 7 | Query timeouts of 5 s, below nginx's 10 s read timeout | The proxy timeout alone | A stuck query frees its connection at 5 s instead of holding it after nginx answers 504 | A query needs more than 5 s |
 | 8 | nginx `1.30` and Node `26`; Postgres stays on `15` | Postgres 17 or 18 | A Postgres major upgrade means `pg_upgrade` or dump and restore, not a stability fix | A maintenance window; PG 15 end of life, November 2027 |
 | 9 | Memory limits per service and a loopback bind | No limits; `0.0.0.0:8080` | A leaking process restarts at its limit; the port is reachable from the host only | A load balancer on another host |
+| 10 | Rate limiting at nginx: `limit_req` at 100 requests a second per client address, a burst of 500, 429 beyond it | `express-rate-limit` in the API | One limit covers every route behind the proxy, the API takes no extra dependency, and a flood stops before it reaches Node or the pool | The API sits behind more than one proxy, or limits must follow the user rather than the address |
 
 ## How I diagnosed it
 
@@ -119,6 +120,7 @@ now: off the request path`"]
 | 11 | Database password hardcoded in `index.js` and Compose | A credential in source, changed only by a code change | Compose reads settings from `.env` (template: [`.env.example`](.env.example)), which is gitignored, and refuses to start without `POSTGRES_PASSWORD` and `APP_DB_PASSWORD` |
 | 12 | `node:20` base image (end of life 2026-04-30), `npm install` with no lockfile, root user | No security fixes, unreproducible builds, a root process | `node:26-alpine`, `npm ci --omit=dev`, npm removed after the install (Trivy found fixable HIGH CVEs in the `undici` and `brace-expansion` copies bundled with npm), a non-root UID, `.dockerignore`; a `HEALTHCHECK` that probes `/status` with `wget`, which Compose's own check on `/ready` overrides in this stack |
 | 13 | `postgres/init.sql` (`max_connections = 20`) and an empty `nginx/nginx.conf` are never mounted | Config that looks active but isn't; the empty `nginx.conf` would stop nginx | Both removed; Postgres keeps its default 100 connections |
+| 14 | No rate limiting | One client can flood `/api/users` and hold every pooled connection, so every other client waits or gets 503 | `limit_req` on `/api/` and `/ready` in [`nginx/conf.d/default.conf`](nginx/conf.d/default.conf) |
 
 ## Running and verifying
 
@@ -148,6 +150,7 @@ The role init script runs only on an empty `pgdata` volume, so a re-run after an
 | After a Postgres restart the API answers again; its restart count is unchanged | The process survives a dropped connection | Crash on a dropped pool connection |
 | `docker compose stop -t 10 api`: the container exits with code 0 within 10 s; the API serves again after `start` | Node receives `SIGTERM`, closes the server and the pool, and exits 0 before Docker sends `SIGKILL` at 10 s | Crash on a dropped pool connection: the clean stop in its fix |
 | After the API is recreated on a new IP, nginx routes to it without a reload | The upstream is re-resolved | nginx caching the API's address |
+| 2,000 requests at concurrency 200 get some 429 answers and no 5xx, and `/api/users` serves again after 6 s | The proxy refuses the excess before it reaches the pool, and the bucket refills | No rate limiting |
 
 The suite fails against the original stack, where `/api/users` gets 502. The rest is covered outside it:
 

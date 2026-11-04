@@ -64,6 +64,14 @@ ok=$(seq 500 | xargs -P 50 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-t
 [ "$ok" = 500 ] || fail "only $ok of 500 concurrent requests returned 200"
 pass "500 requests at concurrency 50 all return 200"
 
+codes=$(seq 2000 | xargs -P 200 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 "$BASE_URL/api/users" | sort | uniq -c | tr -s ' ' | tr '\n' ' ')
+limited=$(grep -oE '[0-9]+ 429' <<<"$codes" | cut -d' ' -f1 || true)
+[ "${limited:-0}" -gt 0 ] || fail "no request was rate limited: $codes"
+grep -qE '[0-9]+ 5[0-9][0-9]' <<<"$codes" && fail "the flood produced server errors: $codes"
+sleep 6
+[ "$(status /api/users)" = 200 ] || fail "/api/users did not serve again after the rate-limit window"
+pass "2,000 requests at concurrency 200 hit the nginx rate limit (${codes% }) and the API serves again after 6 s"
+
 docker compose --progress quiet run --rm --no-deps -T -v "$PWD/tests/pool-leak.js:/app/pool-leak.js:ro" api node /app/pool-leak.js \
   || fail "pool-leak proof did not hold"
 pass "pool-leak proof: connect() without release() exhausts the pool, pool.query() does not"
