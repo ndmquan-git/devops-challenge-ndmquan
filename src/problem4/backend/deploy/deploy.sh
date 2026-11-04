@@ -13,6 +13,8 @@ ENV_FILE="${ENV_FILE:-/etc/p4-backend.env}"
 STATE_FILE="${STATE_FILE:-/var/lib/p4-backend/current-image}"
 PULL_TIMEOUT="${PULL_TIMEOUT:-180}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
+MEMORY_LIMIT="${MEMORY_LIMIT:-512m}"
+CPU_LIMIT="${CPU_LIMIT:-1}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 HEALTH_URL="http://127.0.0.1:${PORT}/healthz"
 
@@ -25,7 +27,18 @@ env_args=()
 start() {
   docker rm -f "$NAME" >/dev/null 2>&1 || true
   docker run -d --name "$NAME" --restart unless-stopped --init \
+    --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+    --memory "$MEMORY_LIMIT" --cpus "$CPU_LIMIT" --pids-limit 256 \
+    --log-opt max-size=10m --log-opt max-file=3 \
     ${env_args[@]+"${env_args[@]}"} -p "${PORT}:3000" "$1" >/dev/null
+}
+
+# A stopped container that references the previous image keeps the prune from
+# deleting it, so a later rollback never depends on the registry.
+pin_previous() {
+  docker rm -f "$NAME-previous" >/dev/null 2>&1 || true
+  [ -n "$previous" ] && [ "$previous" != "$IMAGE" ] && docker create --name "$NAME-previous" "$previous" >/dev/null
+  return 0
 }
 
 healthy() {
@@ -50,6 +63,7 @@ timeout "$PULL_TIMEOUT" docker pull "$IMAGE"
 if start "$IMAGE" && healthy; then
   mkdir -p "$(dirname "$STATE_FILE")"
   echo "$IMAGE" >"$STATE_FILE"
+  pin_previous
   docker image prune -af --filter "until=168h" >/dev/null || true
   echo "deployed $IMAGE"
   exit 0

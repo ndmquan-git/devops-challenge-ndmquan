@@ -14,8 +14,8 @@ repo=123456789012.dkr.ecr.us-east-1.amazonaws.com/p4-backend
 identity='^https://github.com/example/repo/\.github/workflows/_container\.yml@refs/heads/main$'
 
 cleanup() {
-  docker rm -f "$name" >/dev/null 2>&1 || true
-  docker rmi -f "$repo:good" "$repo:bad" "$repo:unsigned" >/dev/null 2>&1 || true
+  docker rm -f "$name" "$name-previous" >/dev/null 2>&1 || true
+  docker rmi -f "$repo:good" "$repo:good2" "$repo:bad" "$repo:unsigned" >/dev/null 2>&1 || true
   rm -rf "$work"
 }
 trap cleanup EXIT
@@ -26,6 +26,7 @@ version() { curl -fs "http://localhost:$port/api/version" || true; }
 docker build -q --build-arg APP_VERSION=good -t "$repo:good" "$here/.." >/dev/null
 printf 'FROM alpine:3\nCMD ["sleep","600"]\n' | docker build -q -t "$repo:bad" - >/dev/null
 docker build -q --build-arg APP_VERSION=unsigned -t "$repo:unsigned" "$here/.." >/dev/null
+docker build -q --build-arg APP_VERSION=good2 -t "$repo:good2" "$here/.." >/dev/null
 
 real_docker=$(command -v docker)
 mkdir -p "$work/bin"
@@ -74,3 +75,14 @@ grep -q "no matching signatures" "$work/unsigned.log" || { cat "$work/unsigned.l
 [ "$(docker inspect -f '{{.State.StartedAt}}' "$name")" = "$started" ] || fail "the running container was replaced"
 [ "$(version)" = '{"version":"good"}' ] || fail "the running image changed after a refused signature"
 pass "an image whose signature check fails is refused and the running container is untouched"
+
+IMAGE="$repo:good2" "$here/deploy.sh" >"$work/good2.log" 2>&1 || { cat "$work/good2.log" >&2; fail "the second healthy image did not deploy"; }
+[ "$(version)" = '{"version":"good2"}' ] || fail "the second healthy image is not serving"
+[ "$(docker inspect -f '{{.Config.Image}}' "$name-previous" 2>/dev/null)" = "$repo:good" ] || fail "the previous image is not pinned against the prune"
+pass "a new image deploys and the previous one stays pinned for rollback"
+
+flags=$(docker inspect -f '{{.HostConfig.ReadonlyRootfs}} {{.HostConfig.Memory}} {{.HostConfig.LogConfig.Config}} {{.HostConfig.CapDrop}}' "$name")
+case "$flags" in
+  "true 536870912 map[max-file:3 max-size:10m] [ALL]") pass "the container runs read-only, memory-capped, with bounded logs and no capabilities" ;;
+  *) fail "unexpected runtime flags: $flags" ;;
+esac
