@@ -1,3 +1,21 @@
+# ECR's own grant on this key covers encrypt on push and decrypt on pull, so
+# pullers in other accounts need no KMS permission. The encryption setting is
+# fixed when the repository is created.
+resource "aws_kms_key" "ecr" {
+  count = var.create_ecr_repository ? 1 : 0
+
+  description             = "Encrypts the ${var.ecr_repository_name} ECR repository"
+  enable_key_rotation     = true
+  deletion_window_in_days = 30
+}
+
+resource "aws_kms_alias" "ecr" {
+  count = var.create_ecr_repository ? 1 : 0
+
+  name          = "alias/ecr-${var.ecr_repository_name}"
+  target_key_id = aws_kms_key.ecr[0].key_id
+}
+
 resource "aws_ecr_repository" "this" {
   count = var.create_ecr_repository ? 1 : 0
 
@@ -9,7 +27,8 @@ resource "aws_ecr_repository" "this" {
   }
 
   encryption_configuration {
-    encryption_type = "AES256"
+    encryption_type = "KMS"
+    kms_key         = aws_kms_key.ecr[0].arn
   }
 }
 
