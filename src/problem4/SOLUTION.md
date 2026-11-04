@@ -50,11 +50,11 @@ GitHub runs workflows only from the repository's root `.github/workflows/`. The 
 |---|---|
 | `backend/` | Express API (`/healthz`, `/api/version`, `/api/items`), unit tests, Dockerfile |
 | `backend/deploy/rollout.sh` | Runs on the CI runner: rolls an image across the instances one at a time |
-| `backend/deploy/deploy.sh` | Runs on each instance through SSM: verifies the signature, swaps the container, health-checks it, rolls back on failure |
+| `backend/deploy/deploy.sh` | Runs on each instance through SSM: verifies the signature, swaps the container (read-only, capped, bounded logs), health-checks it, rolls back on failure |
 | `backend/deploy/test-deploy.sh` | Runs in CI against the runner's Docker: deploys a healthy image, a broken one and one whose signature check fails, and asserts the rollback and the refusal |
 | `frontend/` | Vite SPA that reads `/config.json` at runtime and shows the API version |
 | `frontend/config/<env>.json` | Per-environment runtime config, applied at deploy time |
-| `frontend/deploy/publish.sh` | Uploads the build to S3 with cache headers, invalidates CloudFront, and restores a previous `index.html` version on request |
+| `frontend/deploy/publish.sh` | Uploads the build to S3 with cache headers, invalidates CloudFront and waits for it, and restores the previous `index.html` and `config.json` versions on request |
 | `infra/` | Terraform: OIDC provider, publish role, deploy role per environment, instance profile, ECR repository and its cross-account pull policy |
 | `p4-backend.yml`, `p4-frontend.yml` | The two pipelines |
 | `p4-infra.yml` | Terraform format check, validation and Trivy misconfiguration scan |
@@ -112,7 +112,7 @@ The image moves through three jobs with different rights. `build` holds only `co
 Inside `_deploy-ec2.yml`, each deploy job starts by checking that the reference is a digest, verifying the signature (`cosign verify` against the publishing workflow's identity) and the provenance (`gh attestation verify`), and reading the commit revision from the image's label. `rollout.sh` then handles each instance in turn:
 
 1. Deregister it from the target group and wait for draining.
-2. Send `deploy.sh` through `AWS-RunShellScript` with a 60-second delivery timeout and a 600-second execution timeout, and poll the command until it ends. On the instance, the script verifies the signature again, pulls the image within 180 seconds, replaces the container and polls `/healthz` for up to 60 seconds. If the container fails to start or the check fails, it restarts the previous image.
+2. Send `deploy.sh` through `AWS-RunShellScript` with a 60-second delivery timeout and a 600-second execution timeout, and poll the command until it ends. On the instance, the script verifies the signature again, pulls the image within 180 seconds, replaces the container and polls `/healthz` for up to 60 seconds. The container runs with a read-only root filesystem, no Linux capabilities, a memory and CPU cap, and json-file logs capped at three 10 MB files, and the image itself declares a `HEALTHCHECK`. If the container fails to start or the check fails, it restarts the previous image; a stopped container keeps that previous image from being pruned, so the rollback never depends on the registry.
 3. Register the instance again and wait until the ALB reports it in service.
 4. If the deploy failed, stop the rollout, so at most one instance ever ran a bad build. That instance is back on its previous image when it has one; on a first deploy, or when the previous image also fails, it is re-registered unhealthy and the in-service wait fails the job.
 
@@ -120,7 +120,7 @@ One instance takes at most about 15 minutes: the drain, up to 11.5 minutes for t
 
 The smoke test then reads `/api/version` from the environment's URL and compares it with the revision label, so a deploy that silently kept an old container fails the job.
 
-Inside `_deploy-s3.yml`, `publish.sh` records the live `index.html` version, then uploads in an order that keeps clients consistent: hashed assets first with `max-age=31536000, immutable`, then `config.json` and `index.html` with `no-cache`, then an invalidation of only those two paths. Old assets stay in the bucket, so a tab still running the previous `index.html` can load its chunks. The smoke test fetches `config.json`, `index.html` and every asset `index.html` references; if it fails, the job copies the recorded version back over `index.html` and invalidates it.
+Inside `_deploy-s3.yml`, the job scans the build for secrets with gitleaks, then `publish.sh` records the live `index.html` and `config.json` versions and uploads in an order that keeps clients consistent: hashed assets first with `max-age=31536000, immutable`, then `config.json` and `index.html` with `no-cache`, then an invalidation of only those two paths, which the script waits for. Old assets stay in the bucket, so a tab still running the previous `index.html` can load its chunks. The smoke test checks that the served `index.html` is this build, then fetches `config.json` and every asset `index.html` references; if it fails, the job copies the recorded versions back over `index.html` and `config.json` and invalidates them.
 
 ## What production ready means here
 
@@ -128,12 +128,12 @@ Inside `_deploy-s3.yml`, `publish.sh` records the live `index.html` version, the
 |---|---|
 | Pinned build inputs | Lockfiles with `npm ci` and every action pinned to a full commit SHA. Node is pinned to major 26 in CI and in the image; the `node:26-alpine` tag floats within that major, so the image takes base-image patches while no update bot runs |
 | Build once, promote by identity | Production deploys the exact digest or artifact that staging received; the frontend takes its environment from `config.json` instead of a rebuild |
-| Quality and security gates | ESLint, unit tests, `npm audit` on production dependencies, hadolint, and a Trivy scan that blocks fixable HIGH and CRITICAL vulnerabilities before any publish. Separate workflows run shellcheck on the scripts and a Trivy misconfiguration scan on the Terraform, without gating the deploys |
+| Quality and security gates | ESLint, unit tests, `npm audit` on production dependencies, hadolint, and a Trivy scan that blocks fixable HIGH and CRITICAL vulnerabilities before any publish. Separate workflows run CodeQL on the JavaScript, dependency review on pull requests, shellcheck on the scripts and a Trivy misconfiguration scan on the Terraform, without gating the deploys |
 | Provenance | A keyless signature and a build-provenance attestation on every published image; the runner verifies both before the rollout, and each instance verifies the signature again before the container starts |
 | No stored cloud credentials | OIDC to a role per environment; workflow tokens start at `permissions: {}`, each calling job grants what its reusable workflow needs, and the image build job narrows that to `contents: read` |
 | Controlled promotion | Production is a protected environment with a required reviewer and a `main`-only branch policy; one deploy per application and environment at a time, and a newer run never cancels one mid-rollout |
 | Zero-downtime backend deploys | With at least two instances: one at a time with ALB draining, health checks, automatic rollback on the instance, and a halt on the first failure |
-| Cache-safe frontend deploys | Immutable hashed assets, `no-cache` entry points, a two-path invalidation, and an automatic restore of the previous `index.html` |
+| Cache-safe frontend deploys | Immutable hashed assets, `no-cache` entry points, a two-path invalidation the job waits for, and an automatic restore of the previous `index.html` and `config.json` |
 | Validated rollback | A manual run redeploys an earlier digest or build without a rebuild, after checking that the digest comes from the configured ECR registry or the owner's GHCR namespace, or that the run was a successful push to `main` of the frontend workflow |
 | Tested deploy logic | `test-deploy.sh` runs `deploy.sh` in CI against a healthy image, a broken one and one whose signature check fails, and asserts the rollback and the refusal. It stubs `cosign`, so real Sigstore verification runs only in the deploy jobs and on the instances |
 | Visible deploys | The backend job writes the digest, revision and AWS calls to the job summary, and its smoke test checks the served revision; the frontend job writes the source run and the AWS calls, and its smoke test checks `config.json` and every referenced asset |
@@ -159,7 +159,7 @@ The deploy mechanism, judged against today's conditions (a manual release proces
 | | SSM Run Command (chosen) | CodeDeploy | Ansible |
 |---|---|---|---|
 | Reach from GitHub-hosted runners | AWS API calls under the OIDC role; no inbound port, no SSH keys | AWS API calls | SSH into private instances, which needs a bastion, a self-hosted runner in the VPC, or the `aws_ssm` connection plugin plus an S3 bucket for file transfer |
-| Setup beyond the pipeline | None: the SSM agent ships with Amazon Linux 2023 and Ubuntu AMIs | Agent install, an `appspec.yml` with lifecycle hooks, an application and deployment groups, and revision bundles in S3 | Inventory, SSH keys or the plugin's bucket, a control node, and roles or playbooks |
+| Setup beyond the pipeline | The SSM agent ships with Amazon Linux 2023 and Ubuntu AMIs; Docker, `cosign` and the environment file come from the instance image or its boot script | Agent install, an `appspec.yml` with lifecycle hooks, an application and deployment groups, and revision bundles in S3 | Inventory, SSH keys or the plugin's bucket, a control node, and roles or playbooks |
 | Rollout control | Per-instance commands from `rollout.sh`, which drains and re-registers between them; SSM's own tag targeting with `max-concurrency` and `max-errors` stays unused, because draining needs ALB calls between instances. The two scripts are about 150 lines together | Native rolling and blue/green with ALB integration and alarm-based automatic rollback | `serial` batches; draining and rollback are playbook tasks |
 | Audit | Each command and its output in SSM, and the API call in CloudTrail | Deployment history in the CodeDeploy console and CloudTrail | Runner logs only, unless AWX or AAP is added |
 | Fit for this service | The smallest step up from a manual release, with nothing new to run or learn | Strongest for an Auto Scaling fleet, but heavy for one service; its design centres on file revisions, not container images | Strongest for host configuration management, which this task does not need |
@@ -171,7 +171,7 @@ The deploy mechanism, judged against today's conditions (a manual release proces
 | Backend | Run `p4-backend` manually from `main` with `image` set to an earlier digest reference. The build is skipped; staging and production redeploy that digest | The reference must be `<registry>/p4-backend@sha256:<digest>`, and the registry must be the configured ECR registry or `ghcr.io/<owner>`. The signature and provenance are verified again, which ties the image to this repository, and the version smoke test checks the served revision |
 | Backend, during a rollout | Automatic: `deploy.sh` restarts the previous image on a failed start or health check, and `rollout.sh` stops after the first failed instance | The previous image is the one recorded on the instance at its last successful deploy; a first deploy has none |
 | Frontend | Run `p4-frontend` manually from `main` with `artifact-run-id` set to an earlier run. The build is skipped; staging and production republish that run's artifact | The run must be a successful `push` to `main` of `p4-frontend.yml` within the 30-day artifact retention that `_node.yml` sets; artifacts from pull requests or other workflows are refused |
-| Frontend, during a deploy | Automatic: a failed smoke test copies the previously live `index.html` version back and invalidates it | Needs bucket versioning, which the assumptions require |
+| Frontend, during a deploy | Automatic: a failed smoke test copies the previously live `index.html` and `config.json` versions back and invalidates them | Needs bucket versioning, which the assumptions require |
 
 ## Connecting a real AWS account
 
@@ -195,7 +195,7 @@ The deploy role's permissions are the calls the scripts and the cleanup step mak
 | Item | Why it is out | When to add it |
 |---|---|---|
 | Terraform for the rest of the AWS side (VPC, ALB, instances, bucket, distribution) | The task is the release pipeline; the surrounding estate needs its own plan and apply pipeline. The IAM module in `infra/` is the part the workflows depend on | Before the first real deploy |
-| Dependabot or Renovate | This repository keeps a single amended commit, and each push replaces the previous one, so an update pull request would target a commit the next push discards | In any real repository, for actions, npm and Docker |
+| Dependabot or Renovate | A submission repository with no one assigned to review update pull requests; every action is pinned to a full SHA and every image is scanned on each push instead | In any maintained repository, for actions, npm and Docker |
 | Admission control (Kyverno or equivalent) | There is no cluster to enforce it in; the signature check runs in `deploy.sh` instead | The API moves to EKS or ECS |
 | End-to-end tests against staging | There is no running staging to test | As a job between the staging and production deploys |
 | Canary or metric-based rollback | Needs CloudWatch alarms and traffic shifting | When traffic is high enough for a canary to give a signal |

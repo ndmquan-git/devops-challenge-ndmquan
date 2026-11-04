@@ -99,12 +99,12 @@ In priority order:
 
 | Adversary | Goal | Entry | Controls |
 |---|---|---|---|
-| Account takeover | Withdraw a victim's balance | Cognito sign-in, API keys | MFA before funding, Cognito threat protection, token revocation, withdrawal step-up, scoped API keys, withdrawal policy checks |
+| Account takeover | Withdraw a victim's balance | Cognito sign-in, API keys | MFA before funding, Cognito threat protection, token revocation, refresh-token reuse detection, withdrawal step-up, scoped API keys, cross-user authorization tests, withdrawal policy checks |
 | Hot-wallet thief | A signature on their transaction | Wallet service, production account, CI | Isolated signer, single-region signing, withdrawal policy checks, capped hot float, account per blast radius, signed pipeline |
 | Insider | Move funds, edit balances, erase traces | Console, databases, back-office tools | Append-only ledger, withdrawal policy checks, locked backups, no standing access, locked audit trail |
 | DDoS and extortion | An outage at a market move, or ransom | Route 53, CloudFront, the ALB, market-data service | Private ALB behind a CloudFront VPC origin, WAF rules, Shield Advanced |
 | Supply chain | Attacker code in production | Dependency, base image, CI, SPA | Browser hardening, signed pipeline |
-| API abuse, market manipulation | Spoofing, wash trading, order floods, scraping | API, order and market-data services | WAF rules, scoped API keys, pre-trade caps |
+| API abuse, market manipulation | Spoofing, wash trading, order floods, scraping | API, order and market-data services | WAF rules, scoped API keys, signed-request timestamp window, body-bound idempotency keys, pre-trade caps |
 | Cloud credential theft | A leaked key or pod role | IAM, instance metadata, CI | Pod Identity, private egress, checkpoint integrity, account per blast radius |
 | Malicious chain data | Credit for an unsettled deposit | The wallet service's view of a chain | Halt-only funds reconciler, confirmed deposits |
 
@@ -370,7 +370,7 @@ Marks are against the baseline.
 |---|---|---|---|---|---|
 | Domain lock and CAA | Route 53 | CHANGED | Registrar and registry lock, registrar MFA, CAA for ACM only | Domain hijack, rogue certificate | Refuse to ship without |
 | DNSSEC | Route 53 | CHANGED | DNSSEC on the hosted zone | Forged DNS answers | First 90 days |
-| Private ALB behind a CloudFront VPC origin | CloudFront, the ALB | CHANGED | The ALB private behind a CloudFront [VPC origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html), HTTPS to pods | WAF bypass | Refuse to ship without |
+| Private ALB behind a CloudFront VPC origin | CloudFront, the ALB | CHANGED | The ALB private behind a CloudFront [VPC origin](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-vpc-origins.html), HTTPS to pods; the DR ALB's subnets in ap-northeast-1 avoid the `apne1-az3` Availability Zone, where VPC origins are not supported | WAF bypass | Refuse to ship without |
 | Browser hardening | CloudFront | CHANGED | TLS 1.2 minimum, HSTS, strict CSP, origin access control | Injected script, clickjacking | Refuse to ship without |
 | WAF rules | AWS WAF | CHANGED | Managed rule groups, rate rules per IP and API key, a web ACL on Cognito | Floods, stuffing, injection | Refuse to ship without |
 | Bot Control | AWS WAF | CHANGED | Bot Control on sign-up, sign-in and reset; the separate account-takeover prevention rule group [cannot attach](https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-waf.html) to Cognito | Automation under per-IP limits | First 90 days |
@@ -386,8 +386,10 @@ Marks are against the baseline.
 | MFA before funding | Cognito | CHANGED | MFA before a deposit address or API key: passkeys or TOTP, with email codes for sign-in only; no SMS | Password reuse, SIM swap | Refuse to ship without |
 | Cognito threat protection | Cognito | CHANGED | [Plus plan](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-sign-in-feature-plans.html) threat protection, full-function mode | Credential stuffing | Refuse to ship without |
 | Token revocation | API service, Cognito | CHANGED | Refresh token rotation, 60-minute access tokens, a per-user not-before time in Valkey | A stolen token after sign-out | Refuse to ship without |
+| Refresh-token reuse detection | API service, Cognito | ADDED | Token refresh goes through the API service, which tracks each session's current refresh token by its `origin_jti` claim; a rotated-out refresh token presented after Cognito's grace period revokes the session's refresh token and every access token carrying that `origin_jti` | A stolen refresh token used beside the real client | First 90 days |
 | Withdrawal step-up | API service | CHANGED | Step-up (passkey or TOTP, 5 minutes) for withdrawals, API keys and security changes; a credential change locks withdrawals 24 hours | Session hijack cash-out | Refuse to ship without |
 | Scoped API keys | API service | CHANGED | Scoped API keys (read, trade, withdraw), an IP allow-list for withdraw, Ed25519 request signatures | Leaked or replayed keys | Refuse to ship without |
+| Signed-request timestamp window | API service | ADDED | Each signed API request carries a timestamp inside its signature; the API service refuses one more than 5 seconds from its own clock, and inside the window a repeated order or withdrawal meets its idempotency key | A captured signed request replayed later | Refuse to ship without |
 | Authenticated user streams | Market-data service | CHANGED | User streams carry the access token, checked as the API service checks it | Cross-user reads | Refuse to ship without |
 
 ### Order flow and ledger
@@ -395,6 +397,7 @@ Marks are against the baseline.
 | Control | Component | Mark | Change | Protects against | Tier |
 |---|---|---|---|---|---|
 | Pre-trade caps | Order service, matching engine | CHANGED | Maximum order value, per-account order rates, self-trade prevention in the matching engine, integer minor units, one ledger hold for orders and withdrawals | Double spend, spoofing, wash trades | Refuse to ship without |
+| Body-bound idempotency keys | Ledger service | ADDED | The hold's unique key (the client order id, or the withdrawal request's idempotency key) stores a SHA-256 hash of the exact request body; a retry with the same key and body returns the first result, and one with a different body gets 422 and changes nothing | A retry that places or withdraws twice; a reused key that answers with another request's result | Refuse to ship without |
 | Per-topic MSK writes | MSK, Firehose | CHANGED | [IAM access control](https://docs.aws.amazon.com/msk/latest/developerguide/kafka-actions.html) per topic: the order service writes `orders`, the matching engine writes `fills` and `trades`, Firehose reads only fills and order events; Kafka 3.8 or later, the first version whose IAM access control can abort a hanging transaction; TLS | Forged orders or fills | Refuse to ship without |
 | Fenced leaders and sequenced fills | Matching engine, ledger service | CHANGED | Per-partition transactional IDs for the matching engine's role only; a per-symbol fill sequence that the ledger service checks | Impostor leader, reordered fills | Refuse to ship without |
 | Checkpoint integrity | Checkpoint bucket | CHANGED | Only the matching engine's role writes the checkpoint bucket; versioning keeps each earlier checkpoint | A tampered book loaded on cold start | Refuse to ship without |
@@ -430,7 +433,8 @@ Marks are against the baseline.
 | No standing access | People | ADDED | Identity Center federated to the workforce IdP (FIDO2), no standing write access, two-person time-bound elevation, no SSH, separate wallet administrators | A lone insider, a stolen laptop | Refuse to ship without |
 | Locked audit trail | Detection | ADDED | Organization CloudTrail and Config under [S3 Object Lock](https://docs.aws.amazon.com/AmazonS3/latest/userguide/object-lock.html); GuardDuty with EKS, S3 and RDS protection; alarms on root sign-in, policy changes and `kms:Sign` outside the signer | Unseen compromise, deleted evidence | Refuse to ship without |
 | Runtime and image scanning | Detection | ADDED | GuardDuty Runtime Monitoring on EKS nodes, Security Hub CSPM, Inspector on ECR images | Container escapes, drift, new CVEs | First 90 days |
-| Signed pipeline | CI/CD | ADDED | OIDC roles, digest-pinned dependencies, a scan gate on fixable HIGH and CRITICAL, [ECR managed signing](https://docs.aws.amazon.com/AmazonECR/latest/userguide/managed-signing.html) enforced at admission, two-person review | Tampered dependency, image or pipeline | Refuse to ship without |
+| Signed pipeline | CI/CD | ADDED | OIDC roles, digest-pinned dependencies, a scan gate on fixable HIGH and CRITICAL, two-person review; [ECR managed signing](https://docs.aws.amazon.com/AmazonECR/latest/userguide/managed-signing.html) signs each image on push only, so an EKS admission controller (Kyverno, or Ratify with Gatekeeper) verifies its Notation signature against the AWS Signer profile before any pod starts | Tampered dependency, image or pipeline | Refuse to ship without |
+| Cross-user authorization tests | CI/CD | ADDED | A CI suite signs in two test users and calls every authenticated route with one user's token against the other's order, balance and withdrawal ids; any answer but 403 or 404 fails the build | One user reading or acting on another's orders, balances or withdrawals | Refuse to ship without |
 
 ### Accepted risks
 
@@ -452,18 +456,19 @@ Marks are against the baseline.
 Without these controls a loss is irreversible (funds, keys, ledger, evidence), or adding them later is a rebuild.
 
 - **Withdrawal step-up, isolated signer, single-region signing, withdrawal policy checks, capped hot float, kill switches**: funds leave only through independent checks.
-- **Pre-trade caps, per-topic MSK writes, fenced leaders and sequenced fills, checkpoint integrity, append-only ledger, halt-only funds reconciler, confirmed deposits**: the ledger cannot be silently wrong.
-- **MFA before funding, Cognito threat protection, token revocation, scoped API keys, authenticated user streams**: a stolen password is not enough.
+- **Pre-trade caps, body-bound idempotency keys, per-topic MSK writes, fenced leaders and sequenced fills, checkpoint integrity, append-only ledger, halt-only funds reconciler, confirmed deposits**: the ledger cannot be silently wrong.
+- **MFA before funding, Cognito threat protection, token revocation, scoped API keys, signed-request timestamp window, authenticated user streams**: a stolen password or a captured request is not enough.
 - **Private ALB behind a CloudFront VPC origin, Pod Identity, default-deny pod network, private egress, TLS and cache RBAC, account per blast radius, no standing access**: one stolen credential stays contained; separate accounts later are a migration.
 - **Keys set at creation**: MSK, Aurora, Valkey and Cognito cannot change their key or its multi-Region status afterwards.
 - **Locked backups, locked audit trail**: evidence and backups outlive the attacker.
-- **Domain lock and CAA, browser hardening, WAF rules, signed pipeline**: only reviewed code runs; browser and DNS routes are closed.
+- **Domain lock and CAA, browser hardening, WAF rules, signed pipeline, cross-user authorization tests**: only reviewed code runs, and no release lets one user reach another's account; browser and DNS routes are closed.
 - **Launch gate**: an external penetration test of the API service, wallet service, withdrawal policy engine, signer and the withdrawal flow with no open critical or high finding; one tabletop of the hot-wallet-drain runbook.
 
 ### First 90 days
 
 - **DNSSEC**: a signing mistake takes the domain offline, and the domain lock already blocks the common hijack path.
 - **Bot Control**: rules tuned without real traffic lock customers out.
+- **Refresh-token reuse detection**: rotation and the withdrawal step-up already keep a stolen refresh token from cashing out; detection needs token refresh routed through the API service.
 - **Shield Advanced**: it turns on in minutes; DDoS history, extortion or a high-profile listing pulls it forward.
 - **Nightly matching replay**: it needs reproducible matching engine builds first.
 - **Field encryption**: cluster encryption covers a stolen snapshot; field encryption is schema work.
@@ -512,7 +517,7 @@ Costs are list prices read on 2026-11-03 and 2026-11-04, at ap-southeast-1 rates
 | AWS WAF | A web ACL on Cognito at $5 with its rules, and added managed rule groups at $1 each | 10 to 20 |
 | DNS Firewall | 10 to 50 million queries at $0.60 per million | 5 to 30 |
 | Signer, queues and policy engine state | Lambda, SQS and the state store at withdrawal volume; signing at $0.15 per 10,000 requests, within the default [quota](https://docs.aws.amazon.com/kms/latest/developerguide/requests-per-second.html) | 0 to 5 |
-| **Launch controls** | 4 to 7% of the baseline | **520 to 950** |
+| **Launch controls** | 3.7 to 6.8% of the baseline | **520 to 950** |
 | Shield Advanced | 1-year commitment; one fee covers the organization's accounts and the standard WAF fees on protected resources | 3,000 |
 | Bot Control | Targeted level on sign-up, sign-in and reset: $10 plus $10 per million requests after the first million | 10 to 20 |
 | GuardDuty Runtime Monitoring | 76 to 80 EKS node vCPUs at $1.50 | 115 to 120 |
@@ -522,20 +527,20 @@ Costs are list prices read on 2026-11-03 and 2026-11-04, at ap-southeast-1 rates
 
 ## Facts I would need
 
-| Fact | Source | Why it matters | Assumed meanwhile |
-|---|---|---|---|
-| Licensing regime and regulator | Counsel | Custody, retention, screening, travel rule, reporting | Segregated assets, address screening, 5-year retention under Object Lock |
-| Custody model and insurance | Treasury lead | Hot float cap, approval threshold, cold-storage procedure | 24 hours of the 95th-percentile daily withdrawal volume per asset; offline cold storage |
-| Asset list and signing schemes | Roadmap | KMS has no hierarchical key derivation | secp256k1 or Ed25519 only; addresses derive from public keys |
-| Users' countries and data residency | Counsel | Where personal data may live | Southeast Asia; replication to Tokyo allowed |
-| Peak traffic and DDoS history | Forecast | Whether Shield Advanced is needed at launch; WAF rate limits | No targeted DDoS at launch; 500 rps peak |
-| Workforce identity provider | IT team | Identity Center federates to it | An existing IdP with FIDO2 keys |
-| Compliance targets | Business roadmap | When evidence collection must be continuous | SOC 2 within the first year; no PCI DSS scope |
-| Monthly active users | Business forecast | Sizes Cognito Plus and Bot Control costs | The baseline's 50,000 MAU |
-| KYC vendor and document storage | Compliance | Whether identity documents enter Aurora or the history archive | The vendor holds documents; Aurora stores a reference |
-| Deposit address scheme | Wallet team and treasury | KMS has no hierarchical key derivation, so a KMS key per deposit address costs $1 a month each: about $100,000 a month at 50,000 users on two chains | Not decided. Candidates: addresses derived from an extended public key and swept by an offline-held seed into the KMS-held hot wallet; a per-user memo on the account-based chain; an MPC custody provider. The cost estimate excludes deposit keys |
-| Second deposit source | Wallet team | Confirmed deposits need a second confirmation | A commercial node provider per chain, as a check beside the exchange's own nodes |
-| On-call capacity | Staffing plan | Whether a detection is acted on within minutes | None 24/7 at launch; the withdrawal policy engine and funds reconciler halt automatically |
+| Fact | Source | How to get it | Why it matters | Assumed meanwhile |
+|---|---|---|---|---|
+| Licensing regime and regulator | Counsel | A meeting with counsel on each target country's licensing and travel-rule obligations | Custody, retention, screening, travel rule, reporting | Segregated assets, address screening, 5-year retention under Object Lock |
+| Custody model and insurance | Treasury lead | A treasury questionnaire on float, approval thresholds and refill, checked against the insurer's policy terms | Hot float cap, approval threshold, cold-storage procedure | 24 hours of the 95th-percentile daily withdrawal volume per asset; offline cold storage |
+| Asset list and signing schemes | Roadmap | The listing roadmap, with each chain's signature curve checked against the KMS key specs | KMS has no hierarchical key derivation | secp256k1 or Ed25519 only; addresses derive from public keys |
+| Users' countries and data residency | Counsel | A meeting with counsel on the target countries from the go-to-market plan | Where personal data may live | Southeast Asia; replication to Tokyo allowed |
+| Peak traffic and DDoS history | Forecast | A launch traffic forecast replayed as a load test; the incident record of any domain the exchange already runs | Whether Shield Advanced is needed at launch; WAF rate limits | No targeted DDoS at launch; 500 rps peak |
+| Workforce identity provider | IT team | A question to the IT team: which IdP, and whether it enforces FIDO2 keys | Identity Center federates to it | An existing IdP with FIDO2 keys |
+| Compliance targets | Business roadmap | A planning session with the business owner on the certification clients will ask for first | When evidence collection must be continuous | SOC 2 within the first year; no PCI DSS scope |
+| Monthly active users | Business forecast | The business forecast's sign-up and activity curve for the first year | Sizes Cognito Plus and Bot Control costs | The baseline's 50,000 MAU |
+| KYC vendor and document storage | Compliance | The vendor's integration guide and data processing agreement | Whether identity documents enter Aurora or the history archive | The vendor holds documents; Aurora stores a reference |
+| Deposit address scheme | Wallet team and treasury | A design review between the wallet team and treasury that prices each candidate against the KMS per-key fee | KMS has no hierarchical key derivation, so a KMS key per deposit address costs $1 a month each: about $100,000 a month at 50,000 users on two chains | Not decided. Candidates: addresses derived from an extended public key and swept by an offline-held seed into the KMS-held hot wallet; a per-user memo on the account-based chain; an MPC custody provider. The cost estimate excludes deposit keys |
+| Second deposit source | Wallet team | A testnet trial comparing candidate providers' blocks with the exchange's own nodes | Confirmed deposits need a second confirmation | A commercial node provider per chain, as a check beside the exchange's own nodes |
+| On-call capacity | Staffing plan | A staffing plan review with the operations lead | Whether a detection is acted on within minutes | None 24/7 at launch; the withdrawal policy engine and funds reconciler halt automatically |
 
 ## Trade-offs
 

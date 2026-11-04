@@ -70,6 +70,33 @@ I ran the original stack and worked from the outside in: the request path first,
 
 ## Root causes and fixes
 
+The request path, with the fault each hop had in the original stack and its fix:
+
+```mermaid
+flowchart LR
+  c["`**client**`"] --> n["`**nginx**
+was: port 3001
+was: cached address
+now: port 3000
+now: re-resolves every 10 s`"]
+  n --> a["`**API**
+was: unhandled pool error
+was: leaked clients
+was: awaited Redis
+now: pool error listener
+now: pool.query()
+now: 5 s query timeouts
+now: best-effort write`"]
+  a --> p["`**Postgres**
+was: superuser login
+was: early socket probe
+now: app role
+now: TCP probe`"]
+  a -. best effort .-> r["`**Redis**
+was: outage stalled calls
+now: off the request path`"]
+```
+
 ### Outage causes
 
 | # | Root cause | Impact | Fix |
@@ -90,7 +117,7 @@ I ran the original stack and worked from the outside in: the request path first,
 | 9 | No memory limits; port 8080 on all interfaces | One runaway process can starve the host; the API is reachable from every network | `deploy.resources.limits.memory` (api 256M, nginx 64M, redis 128M, postgres 512M); `127.0.0.1:8080:80` |
 | 10 | The API connects as the Postgres superuser | A leaked credential or an injected statement can drop databases or create roles | [`postgres/init/01-app-role.sh`](postgres/init/01-app-role.sh) creates `app` with `LOGIN`, `CONNECT` on the database and `USAGE` on `public`; identifiers and the password pass as `psql` variables (`:"user"`, `:'pw'`), never interpolated; the API connects as `APP_DB_USER` |
 | 11 | Database password hardcoded in `index.js` and Compose | A credential in source, changed only by a code change | Compose reads settings from `.env` (template: [`.env.example`](.env.example)), which is gitignored, and refuses to start without `POSTGRES_PASSWORD` and `APP_DB_PASSWORD` |
-| 12 | `node:20` base image (end of life 2026-04-30), `npm install` with no lockfile, root user | No security fixes, unreproducible builds, a root process | `node:26-alpine`, `npm ci --omit=dev`, npm removed after the install (Trivy found fixable HIGH CVEs in the `undici` and `brace-expansion` copies bundled with npm), a non-root UID, `.dockerignore` |
+| 12 | `node:20` base image (end of life 2026-04-30), `npm install` with no lockfile, root user | No security fixes, unreproducible builds, a root process | `node:26-alpine`, `npm ci --omit=dev`, npm removed after the install (Trivy found fixable HIGH CVEs in the `undici` and `brace-expansion` copies bundled with npm), a non-root UID, `.dockerignore`; a `HEALTHCHECK` that probes `/status` with `wget`, which Compose's own check on `/ready` overrides in this stack |
 | 13 | `postgres/init.sql` (`max_connections = 20`) and an empty `nginx/nginx.conf` are never mounted | Config that looks active but isn't; the empty `nginx.conf` would stop nginx | Both removed; Postgres keeps its default 100 connections |
 
 ## Running and verifying

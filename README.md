@@ -12,11 +12,11 @@ My solutions to a DevOps challenge.
 | 4 | [src/problem4](src/problem4/SOLUTION.md) | CI/CD for an API on EC2 and an SPA on S3 | [![p4-backend](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-backend.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-backend.yml) [![p4-frontend](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-frontend.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-frontend.yml) [![p4-infra](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-infra.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-infra.yml) [![p4-docs](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-docs.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p4-docs.yml) |
 | 5 | [src/problem5](src/problem5/SOLUTION.md) | Security built into the Problem 1 design | [![p5-ci](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p5-ci.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/p5-ci.yml) |
 
-[![repo-checks](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/repo-checks.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/repo-checks.yml) runs actionlint, zizmor, gitleaks and a Trivy filesystem scan on every push.
+[![repo-checks](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/repo-checks.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/repo-checks.yml) runs actionlint, zizmor, gitleaks and a Trivy filesystem scan on every push, and [![code-analysis](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/code-analysis.yml/badge.svg)](https://github.com/ndmquan-git/devops-challenge-ndmquan/actions/workflows/code-analysis.yml) runs CodeQL on the JavaScript, plus dependency review on pull requests.
 
 ## CI
 
-Every problem has its own workflow in [`.github/workflows/`](.github/workflows/). Pull requests run only the workflows whose folder changed. Every push to `main` runs all of them, because this repository keeps a single amended commit: each push shares no ancestor with the previous one, so GitHub cannot compute which paths changed.
+Every problem has its own workflow in [`.github/workflows/`](.github/workflows/). Pull requests run only the workflows whose folder changed. Every push to `main` runs all of them, so each badge always describes the latest commit.
 
 Stages that several problems share are reusable workflows:
 

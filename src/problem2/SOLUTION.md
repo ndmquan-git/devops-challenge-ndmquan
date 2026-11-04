@@ -89,8 +89,19 @@ A passing health check proves only the in-memory path. `crit` lines with errno 2
 
 - **Read-only or disk errors**: free nothing; follow the I/O fault row under Less common causes.
 - **Inodes above 90%**: go to Inode exhaustion.
-- **A possible intrusion** (an unknown file or writer): snapshot the volume first.
 - **Another node can carry the traffic**: take this one out of rotation now; its health check keeps passing. A sole load balancer keeps serving.
+
+### When the disk fill is an attack
+
+Treat the fill as an intrusion when any of these appear:
+
+- **Unexpected large files**: outside `/var/log/nginx`, `/var/cache/nginx`, `/var/lib/nginx` and `/var/log/journal`.
+- **Archives or dumps**: in `/tmp`, `/var/tmp` or a home directory.
+- **New access**: a user in `/etc/passwd` or a key in `authorized_keys` that nobody recognises.
+- **Outbound traffic spike**: to an address that is neither a client nor an upstream.
+- **Unowned jobs**: a cron entry or systemd unit that no package or team claims.
+
+Stop freeing space: each deletion destroys evidence. Isolate the instance with a security group that admits only the investigator, or take it out of rotation once a peer carries the traffic. Snapshot the volume. Capture memory and volatile state (processes, sockets, `/proc`) where the tooling exists. Rebuild from a known image rather than cleaning in place, and rotate every credential the host held.
 
 ### Copy evidence before freeing anything
 

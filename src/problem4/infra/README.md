@@ -76,5 +76,5 @@ IAM evaluates only the `aud`, `sub`, `amr`, `azp`, `email` and `oaud` claims of 
 ```bash
 terraform fmt -check -recursive && terraform init -backend=false && terraform validate
 trivy config --severity HIGH,CRITICAL --exit-code 1 .
-tflint
+tflint    # local only; the p4-infra workflow runs the first two lines
 ```
