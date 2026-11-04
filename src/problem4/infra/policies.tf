@@ -1,4 +1,6 @@
 data "aws_iam_policy_document" "publish" {
+  count = local.holds_ecr ? 1 : 0
+
   statement {
     sid       = "EcrLogin"
     actions   = ["ecr:GetAuthorizationToken"]
@@ -21,9 +23,11 @@ data "aws_iam_policy_document" "publish" {
 }
 
 resource "aws_iam_role_policy" "publish" {
+  count = local.holds_ecr ? 1 : 0
+
   name   = "ecr-push"
-  role   = aws_iam_role.publish.id
-  policy = data.aws_iam_policy_document.publish.json
+  role   = aws_iam_role.publish[0].id
+  policy = data.aws_iam_policy_document.publish[0].json
 }
 
 data "aws_iam_policy_document" "deploy" {
@@ -75,11 +79,8 @@ data "aws_iam_policy_document" "deploy" {
   }
 
   statement {
-    sid = "CommandStatus"
-    actions = [
-      "ssm:GetCommandInvocation",
-      "ssm:ListCommandInvocations",
-    ]
+    sid       = "CommandStatus"
+    actions   = ["ssm:GetCommandInvocation"]
     resources = ["*"]
   }
 

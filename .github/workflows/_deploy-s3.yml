@@ -19,15 +19,6 @@ on:
         required: false
         type: string
         default: ""
-      source-workflow:
-        description: Workflow file a foreign artifact run must come from
-        required: false
-        type: string
-        default: .github/workflows/p4-frontend.yml
-      publish-script:
-        required: false
-        type: string
-        default: src/problem4/frontend/deploy/publish.sh
 
 defaults:
   run:
@@ -55,7 +46,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           RUN_ID: ${{ inputs.artifact-run-id }}
-          SOURCE: ${{ inputs.source-workflow }}
+          SOURCE: .github/workflows/p4-frontend.yml
         run: |
           [[ "$RUN_ID" =~ ^[0-9]+$ ]] || { echo "::error::artifact-run-id must be numeric"; exit 1; }
           read -r event branch conclusion path < <(gh api "repos/$REPO/actions/runs/$RUN_ID" \
@@ -85,8 +76,7 @@ jobs:
           ENV_NAME: ${{ inputs.environment }}
           BUCKET: ${{ vars.FRONTEND_BUCKET || '<bucket>' }}
           DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID || '<distribution-id>' }}
-          SCRIPT: ${{ inputs.publish-script }}
-        run: PUBLISH_STATE="$GITHUB_OUTPUT" "$SCRIPT" 2>&1 | tee publish.log
+        run: PUBLISH_STATE="$GITHUB_OUTPUT" src/problem4/frontend/deploy/publish.sh 2>&1 | tee publish.log
 
       - name: Smoke test
         id: smoke
@@ -107,9 +97,8 @@ jobs:
           ENV_NAME: ${{ inputs.environment }}
           BUCKET: ${{ vars.FRONTEND_BUCKET }}
           DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
-          SCRIPT: ${{ inputs.publish-script }}
           PREVIOUS: ${{ steps.publish.outputs.previous_index_version }}
-        run: '"$SCRIPT" --restore "$PREVIOUS" 2>&1 | tee -a publish.log'
+        run: src/problem4/frontend/deploy/publish.sh --restore "$PREVIOUS" 2>&1 | tee -a publish.log
 
       - name: Summary
         if: always()

@@ -33,7 +33,7 @@ mount_options() {
   have findmnt || skip findmnt
   findmnt -n -o TARGET,SOURCE,FSTYPE,OPTIONS -T "$TARGET"
   if findmnt -n -o OPTIONS -T "$TARGET" | grep -qE '(^|,)ro(,|$)'; then
-    echo "SIGNAL: mounted read-only; the kernel remounted it after an error, or it never came up read-write (R15)"
+    echo "SIGNAL: mounted read-only; the kernel remounted it after an error, or it never came up read-write (I/O fault or read-only remount)"
   fi
 }
 
@@ -69,14 +69,14 @@ kernel_log() {
 }
 
 block_devices() {
-  section "Block devices: a disk larger than its partitions is a resize that was never grown (R16)"
+  section "Block devices: a disk larger than its partitions is a resize that was never grown"
   have lsblk || skip lsblk
   lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS
   lsblk -b -n -r -o NAME,SIZE,TYPE,PKNAME | awk '
     $3 == "disk" { disk[$1] = $2 }
     $3 == "part" { used[$4] += $2 }
     END { for (d in disk) { gap = disk[d] - used[d]
-      if (gap > 2^30) printf "SIGNAL: %s has %.1f GiB outside any partition: growpart, then resize2fs (R16)\n", d, gap / 2^30 } }'
+      if (gap > 2^30) printf "SIGNAL: %s has %.1f GiB outside any partition: TMPDIR=/dev/shm growpart, then resize2fs, or pvresize and lvextend -r on LVM (root partition never grown)\n", d, gap / 2^30 } }'
 }
 
 lvm_layout() {
@@ -84,6 +84,8 @@ lvm_layout() {
   have vgs || skip lvm2
   vgs --noheadings -o vg_name,vg_size,vg_free
   lvs --noheadings -o lv_name,vg_name,lv_size,lv_path
+  vgs --noheadings --units b --nosuffix -o vg_name,vg_free | awk '
+    $2 > 2^30 { printf "SIGNAL: volume group %s has %.1f GiB free: lvextend -r (root logical volume never extended)\n", $1, $2 / 2^30 }'
 }
 
 deleted_open() {
@@ -133,7 +135,7 @@ big_files() {
 inode_hotspots() {
   local pct
   pct=$(df --output=ipcent "$TARGET" | tail -n 1 | tr -dc '0-9')
-  if [[ -z $pct || $pct -lt 80 ]]; then return 0; fi
+  if [[ -z $pct || $pct -lt 90 ]]; then return 0; fi
   section "Directories with the most entries (inode use is ${pct}%)"
   low find "$TARGET" -xdev -printf '%h\n' 2>/dev/null \
     | awk '{ c[$0]++ } END { for (d in c) print c[d], d }' | sort -rn | first || true
@@ -153,7 +155,7 @@ nginx_checks() {
     find /var/log/nginx -maxdepth 1 -type f -printf '%s\t%TY-%Tm-%Td %TH:%TM\t%u:%g\t%f\n' \
       | sort -rn | first | numfmt --to=iec --field=1
     if [[ -f /var/log/nginx/access.log && ! -s /var/log/nginx/access.log && /var/log/nginx/access.log.1 -nt /var/log/nginx/access.log ]]; then
-      echo "SIGNAL: access.log is empty and access.log.1 is newer: nginx did not reopen its logs after rotation (R3)"
+      echo "SIGNAL: access.log is empty and access.log.1 is newer: nginx did not reopen its logs after rotation (rotated logs not reopened)"
     fi
   fi
 }

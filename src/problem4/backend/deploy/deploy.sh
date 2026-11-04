@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# Runs on an EC2 instance through SSM Run Command: verify IMAGE's signature when
-# an identity is given, switch the backend container to it, health-check it, and
-# roll back to the previous image on failure.
+# Runs on an EC2 instance through SSM Run Command: verify IMAGE's signature,
+# switch the backend container to it, health-check it, and roll back to the
+# previous image on failure. The pull and each health check are bounded so the
+# swap always finishes inside the command's execution timeout.
 set -euo pipefail
 
 : "${IMAGE:?IMAGE is required, e.g. <registry>/p4-backend@sha256:<digest>}"
+: "${COSIGN_IDENTITY_REGEXP:?COSIGN_IDENTITY_REGEXP is required: the signer identity the image must carry}"
 NAME="${NAME:-p4-backend}"
 PORT="${PORT:-8080}"
 ENV_FILE="${ENV_FILE:-/etc/p4-backend.env}"
 STATE_FILE="${STATE_FILE:-/var/lib/p4-backend/current-image}"
-HEALTH_TRIES="${HEALTH_TRIES:-30}"
-COSIGN_IDENTITY_REGEXP="${COSIGN_IDENTITY_REGEXP:-}"
+PULL_TIMEOUT="${PULL_TIMEOUT:-180}"
+HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-60}"
 COSIGN_OIDC_ISSUER="${COSIGN_OIDC_ISSUER:-https://token.actions.githubusercontent.com}"
 HEALTH_URL="http://127.0.0.1:${PORT}/healthz"
 
@@ -27,11 +29,11 @@ start() {
 }
 
 healthy() {
-  for _ in $(seq "$HEALTH_TRIES"); do
-    curl -fs -o /dev/null "$HEALTH_URL" && return 0
+  local deadline=$((SECONDS + HEALTH_TIMEOUT))
+  until curl -fs --max-time 2 -o /dev/null "$HEALTH_URL"; do
+    [ "$SECONDS" -lt "$deadline" ] || return 1
     sleep 2
   done
-  return 1
 }
 
 if [[ "$registry" == *.amazonaws.com ]]; then
@@ -39,15 +41,11 @@ if [[ "$registry" == *.amazonaws.com ]]; then
   aws ecr get-login-password --region "$region" | docker login --username AWS --password-stdin "$registry"
 fi
 
-if [ -n "$COSIGN_IDENTITY_REGEXP" ]; then
-  cosign verify --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
-    --certificate-identity-regexp "$COSIGN_IDENTITY_REGEXP" "$IMAGE" >/dev/null
-  echo "signature verified for $IMAGE"
-else
-  echo "warning: COSIGN_IDENTITY_REGEXP is unset, the image signature was not verified" >&2
-fi
+cosign verify --certificate-oidc-issuer "$COSIGN_OIDC_ISSUER" \
+  --certificate-identity-regexp "$COSIGN_IDENTITY_REGEXP" "$IMAGE" >/dev/null
+echo "signature verified for $IMAGE"
 
-docker pull "$IMAGE"
+timeout "$PULL_TIMEOUT" docker pull "$IMAGE"
 
 if start "$IMAGE" && healthy; then
   mkdir -p "$(dirname "$STATE_FILE")"

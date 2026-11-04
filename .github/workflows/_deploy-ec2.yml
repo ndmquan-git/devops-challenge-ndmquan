@@ -3,7 +3,8 @@ name: deploy-ec2
 # Settings come from GitHub environment variables (AWS_DEPLOY_ROLE_ARN,
 # TARGET_GROUP_ARN, BACKEND_URL). Without AWS_DEPLOY_ROLE_ARN the rollout runs
 # as a dry run and prints the AWS calls it would make. The signature and
-# provenance checks run in every mode.
+# provenance checks run in every mode. The 60-minute limit covers four instances
+# at rollout.sh's worst case of about 15 minutes each.
 on:
   workflow_call:
     inputs:
@@ -19,10 +20,6 @@ on:
         required: false
         type: string
         default: p4-backend
-      rollout-script:
-        required: false
-        type: string
-        default: src/problem4/backend/deploy/rollout.sh
 
 defaults:
   run:
@@ -31,7 +28,7 @@ defaults:
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     environment: ${{ inputs.environment }}
     concurrency:
       group: deploy-${{ inputs.app-tag }}-${{ inputs.environment }}
@@ -102,8 +99,19 @@ jobs:
           ENV_NAME: ${{ inputs.environment }}
           TARGET_GROUP_ARN: ${{ vars.TARGET_GROUP_ARN || 'arn:aws:elasticloadbalancing:<region>:<account>:targetgroup/<name>/<id>' }}
           COSIGN_IDENTITY_REGEXP: ${{ env.SIGNER_REGEXP }}
-          SCRIPT: ${{ inputs.rollout-script }}
-        run: '"$SCRIPT" 2>&1 | tee rollout.log'
+          DRAINED_FILE: drained-target
+        run: src/problem4/backend/deploy/rollout.sh 2>&1 | tee rollout.log
+
+      - name: Register a drained instance again
+        if: always() && env.DRY_RUN == '0'
+        env:
+          TARGET_GROUP_ARN: ${{ vars.TARGET_GROUP_ARN }}
+        run: |
+          target=$(cat drained-target 2>/dev/null || true)
+          if [ -n "$target" ]; then
+            aws elbv2 register-targets --target-group-arn "$TARGET_GROUP_ARN" --targets "$target"
+            echo "::warning::the rollout stopped with $target drained; it is registered again"
+          fi
 
       - name: Smoke test
         if: env.DRY_RUN == '0'

@@ -13,6 +13,12 @@ app_tag               = "p4-backend"
 ecr_repository_name   = "p4-backend"
 create_ecr_repository = true
 
+# Separate accounts: the account that holds the repository lists the other one;
+# the other names the holder and creates no repository.
+# ecr_pull_account_ids  = ["210987654321"]   # in the holding account
+# ecr_account_id        = "123456789012"     # in the other account
+# create_ecr_repository = false              # in the other account
+
 environments = {
   staging = {
     target_group_arn           = "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/example-staging/0123456789abcdef"

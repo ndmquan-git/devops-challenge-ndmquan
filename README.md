@@ -33,7 +33,8 @@ Requires Docker with Docker Compose.
 
 ```bash
 cd src/problem3
-cp .env.example .env    # then set POSTGRES_PASSWORD
+cp .env.example .env    # then set POSTGRES_PASSWORD and APP_DB_PASSWORD, e.g. openssl rand -base64 20
+docker compose down -v  # the app role is created only on an empty database volume
 docker compose up --build --wait
 ./tests/smoke.sh
 ```

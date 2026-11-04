@@ -1,8 +1,8 @@
 name: container
 
-# build runs with no credentials: lint, build, scan. publish runs only when the
+# build holds only contents: read: lint, build, scan. publish runs only when the
 # caller sets push and grants packages: write, id-token: write and
-# attestations: write; it pushes by digest, signs keylessly and attests
+# attestations: write; it pushes, reads the digest, signs keylessly and attests
 # provenance. The registry is ECR when vars.ECR_REGISTRY and
 # vars.AWS_ECR_ROLE_ARN are set, otherwise this repository's GHCR namespace.
 on:
@@ -40,6 +40,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
     env:
       LOCAL_TAG: local/${{ inputs.image-name }}:${{ github.sha }}
     steps:
@@ -146,7 +148,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Push by digest
+      - name: Push and read the digest
         id: push
         env:
           REGISTRY: ${{ steps.registry.outputs.registry }}

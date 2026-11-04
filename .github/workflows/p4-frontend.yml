@@ -23,6 +23,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   ci:
     if: github.event_name != 'workflow_dispatch' || inputs.artifact-run-id == ''
@@ -34,8 +38,19 @@ jobs:
       build: true
       artifact-name: frontend-dist
 
+  rollback-input:
+    if: github.event_name == 'workflow_dispatch' && inputs.artifact-run-id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Accept a rollback only from main
+        run: |
+          [ "$GITHUB_REF" = refs/heads/main ] \
+            || { echo "::error::dispatch a rollback from main, not $GITHUB_REF"; exit 1; }
+
   deploy-staging:
-    needs: ci
+    needs: [ci, rollback-input]
     if: >-
       !cancelled() && !failure()
       && github.event_name != 'pull_request' && github.ref == 'refs/heads/main'

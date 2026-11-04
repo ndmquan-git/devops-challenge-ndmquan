@@ -32,6 +32,34 @@ pass "/status returns 200 through nginx"
 [ "$(status /ready)" = 200 ] || fail "/ready did not return 200 through nginx"
 pass "/ready returns 200 through nginx"
 
+bindings=$(docker inspect -f '{{range .HostConfig.PortBindings}}{{range .}}{{.HostIp}}:{{.HostPort}} {{end}}{{end}}' "$(docker compose ps -q nginx)")
+[ "${bindings% }" = 127.0.0.1:8080 ] || fail "nginx is published on ${bindings% }, not only on 127.0.0.1:8080"
+pass "nginx is published on 127.0.0.1:8080 only"
+
+limits=""
+for service in $(docker compose config --services); do
+  bytes=$(docker inspect -f '{{.HostConfig.Memory}}' "$(docker compose ps -q "$service")")
+  [ "$bytes" -gt 0 ] || fail "$service has no memory limit"
+  limits+=" $service=$((bytes / 1048576))M"
+done
+pass "every service has a memory limit:$limits"
+
+role=$(docker compose exec -T api node -e '
+  const { Client } = require("pg");
+  const { DB_HOST: host, DB_USER: user, DB_PASSWORD: password, DB_NAME: database } = process.env;
+  const client = new Client({ host, user, password, database });
+  client.connect()
+    .then(() => client.query("SELECT current_user AS name, rolsuper FROM pg_roles WHERE rolname = current_user"))
+    .then(({ rows }) => console.log(rows[0].name, rows[0].rolsuper))
+    .finally(() => client.end());') || fail "could not read the api's database role"
+[ "${role#* }" = false ] || fail "the api logs in as a superuser ($role)"
+pass "the api logs in as ${role% *}, which is not a superuser"
+
+if POSTGRES_PASSWORD='' APP_DB_PASSWORD='' docker compose config --quiet 2>/dev/null; then
+  fail "compose accepted empty database passwords"
+fi
+pass "compose refuses to start without POSTGRES_PASSWORD and APP_DB_PASSWORD"
+
 ok=$(seq 500 | xargs -P 50 -I{} curl -s -o /dev/null -w '%{http_code}\n' --max-time 10 "$BASE_URL/api/users" | grep -c '^200$' || true)
 [ "$ok" = 500 ] || fail "only $ok of 500 concurrent requests returned 200"
 pass "500 requests at concurrency 50 all return 200"
@@ -45,6 +73,18 @@ code=$(status /api/users)
 docker compose start redis >/dev/null 2>&1
 [ "$code" = 200 ] || fail "with redis stopped, /api/users returned $code"
 pass "/api/users returns 200 within 5s while redis is down"
+
+# Leave an idle pooled connection, so the frozen server meets the query timeout, not the connect timeout.
+status /api/users >/dev/null
+docker compose pause postgres >/dev/null 2>&1
+frozen=$(curl -s -o /dev/null -w '%{http_code} %{time_total}' --max-time 15 "$BASE_URL/api/users" || true)
+docker compose unpause postgres >/dev/null 2>&1
+code=${frozen% *} seconds=${frozen#* }
+[ "$code" = 503 ] || fail "with postgres frozen, /api/users returned $code after ${seconds}s"
+awk -v s="$seconds" 'BEGIN { exit !(s >= 4.5 && s < 10) }' \
+  || fail "with postgres frozen, /api/users answered after ${seconds}s, not at the 5s query timeout"
+wait_for_200 /api/users 30 || fail "/api/users did not recover after postgres was unfrozen"
+pass "with postgres frozen, /api/users returns 503 after ${seconds}s, inside nginx's 10s read timeout"
 
 restarts=$(api_restarts)
 docker compose restart postgres >/dev/null 2>&1

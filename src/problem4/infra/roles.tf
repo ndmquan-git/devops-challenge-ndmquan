@@ -1,4 +1,6 @@
 data "aws_iam_policy_document" "publish_trust" {
+  count = local.holds_ecr ? 1 : 0
+
   statement {
     actions = ["sts:AssumeRoleWithWebIdentity"]
 
@@ -22,9 +24,11 @@ data "aws_iam_policy_document" "publish_trust" {
 }
 
 resource "aws_iam_role" "publish" {
+  count = local.holds_ecr ? 1 : 0
+
   name                 = "${var.github_repo}-github-publish"
   description          = "GitHub Actions: push ${var.ecr_repository_name} images from ${local.github_branch}"
-  assume_role_policy   = data.aws_iam_policy_document.publish_trust.json
+  assume_role_policy   = data.aws_iam_policy_document.publish_trust[0].json
   max_session_duration = 3600
 }
 

@@ -1,6 +1,6 @@
 # Problem 2: Diagnose Me Doctor
 
-An Ubuntu 24.04 VM running only NGINX as a load balancer reports its root disk at 99%. This runbook keeps it serving, copies evidence before freeing anything, reclaims what is safe to drop, then follows a fixed order of checks to one of sixteen causes. [`diagnose-disk.sh`](diagnose-disk.sh) runs the read-only checks in one pass; [`tests/rotate-check.sh`](tests/rotate-check.sh) proves that rotation makes NGINX reopen its logs.
+An Ubuntu 24.04 VM running only NGINX as a load balancer reports its root disk at 99%. This runbook keeps it serving, copies evidence before freeing anything, reclaims what is safe to drop, then follows a fixed order of checks to one of seventeen causes. [`diagnose-disk.sh`](diagnose-disk.sh) runs the read-only checks in one pass; [`tests/rotate-check.sh`](tests/rotate-check.sh) proves that the packaged rotation makes NGINX reopen its logs.
 
 ## Contents
 
@@ -18,39 +18,38 @@ An Ubuntu 24.04 VM running only NGINX as a load balancer reports its root disk a
 
 - **The alert**: `/` at 99% on one VM whose only workload is NGINX.
 - **Keeping it serving**: what fails, what to free first, how to buy headroom.
-- **Finding the cause**: ordered checks and sixteen causes.
+- **Finding the cause**: ordered checks and the causes they lead to.
 - **Not recurring**: alerts and configuration.
 
 ### Out of scope
 
 - **Other workloads on the VM**: the check order still applies.
-- **Provider tooling**: resize, snapshot and volume health, named by function.
+- **Provider tooling**: resize, snapshot, draining and volume health, named by function.
 - **The fleet**: log pipeline and retention beyond this VM.
 - **Other filesystems**: XFS and Btrfs, except where they differ from ext4.
 
 ### Assumptions
 
 - **One scenario**: the task names "two production issues" but describes one.
-- **One 64 GB ext4 root, no LVM**: an installer-built filesystem reserves 5% for root (3.2 GB); the cloud image root reserves none (`tune2fs -l`: `Reserved block count: 0`).
+- **One ext4 root, sized here at 64 GB**: a cloud image root spans the disk and reserves nothing (`tune2fs -l`: `Reserved block count: 0`); the Ubuntu Server installer puts `/` on LVM at half the volume group and reserves 5%.
 - **The Ubuntu NGINX package**: 1.24, logs in `/var/log/nginx`, temp files in `/var/lib/nginx`, workers as `www-data`, 14 daily rotations.
 - **A systemd service**: in Docker, the unbounded `json-file` log under `/var/lib/docker/containers/` is the first suspect.
 - **journald on disk, forwarding to rsyslog**: `ForwardToSyslog=yes` in `/usr/lib/systemd/journald.conf.d/syslog.conf`.
-- **Unknowns**: whether a shipper runs and whether other nodes share traffic, so no step drains this one.
-- **Commands run as root**; `du` and `/proc/<pid>/fd` are partial otherwise.
+- **Unknowns**: whether a shipper runs and whether another node can take this one's traffic.
 
 ## Decisions
 
 | # | Decision | Alternatives considered | Why | Revisit when |
 |---|---|---|---|---|
-| 1 | Copy a tail of each deleted-but-open file before freeing space | Free first | `reopen`, truncate or a shipper restart discards the file | Lines confirmed off-box |
+| 1 | Copy a tail of each deleted-but-open file before freeing space | Free first | `reopen`, truncate or a shipper restart discards the file | A shipper confirms delivery |
 | 2 | Truncate an open log, never `rm` it | `rm` and restart | `rm` frees nothing while a descriptor is open | Never, for a held file |
 | 3 | `nginx -s reopen`, not `systemctl restart nginx` | Restart; `reload` | `reopen` drops no connection; a stop cuts transfers at 5 seconds (`--retry QUIT/5`) | The master is wedged |
-| 4 | Cap the journal with `SystemMaxUse=` | `ForwardToSyslog=no`; lower `MaxRetentionSec=` | Bounds the disk whatever a unit logs | A shipper reads the journal |
+| 4 | Cap the journal with `SystemMaxUse=` | `ForwardToSyslog=no`; lower `MaxRetentionSec=` | Bounds the disk whatever a unit logs | A shipper reads the journal, so rsyslog's copy can go |
 | 5 | `proxy_cache_path` with `max_size`, `min_free`, `inactive` | A cron purge | The cache manager evicts in-process; a purge job races it | The cache has its own volume |
-| 6 | A separate volume for `/var/log` and `/var/cache/nginx` | A larger root; quotas | A flood stops there while apt, sshd and `/` keep working | Logs leave at once |
-| 7 | Ship logs off the VM, keep two or three days locally | 14 days local | Disk-sized retention breaks at the next traffic step | 14 days fits in half the disk |
+| 6 | Separate volumes for `/var/log`, `/var/cache/nginx` and `/var/lib/nginx` | A larger root; quotas | A flood stops there; apt, sshd and `/` keep working | Logs leave at once |
+| 7 | Ship logs off the VM, keep 48 hours locally | 14 days local | 14 days at 1,000 requests per second is 61 GB | 14 days fits in half the disk |
 | 8 | Alert on time to full and available bytes | 90% and 95% thresholds | 18.6 GB a day fills 64 GB from 85% in 12 hours | 5% exceeds a day of growth |
-| 9 | `tune2fs -m 1` as a bridge, `-m 5` after the fix | Leave 1%; never touch it | About 2.6 GB on 64 GB | `Reserved block count: 0` |
+| 9 | `tune2fs -m 1` as a bridge, `-m 5` after the fix | Leave 1%; never touch it | About 2.6 GB on 64 GB | The root reserves nothing |
 
 ## What a full disk does to the load balancer
 
@@ -72,72 +71,77 @@ Workers run as `www-data` and get `ENOSPC` (`28: No space left on device`) once 
 
 ## First 15 minutes: keep it serving
 
-Paste the commands into a plain interactive shell: under `set -e` a `grep` with no match closes the shell, and an `EXIT` trap that removes its working directory takes the staged evidence with it.
+Run these commands one at a time in an interactive root shell (`du` and `/proc/<pid>/fd` are partial otherwise), not as a script: under `set -e` a `grep` that matches nothing ends it.
 
 ### Confirm what is full and whether NGINX still serves
 
 ```bash
 df -hT /                     # available excludes root's reserve
-df -i /                      # near 100% with bytes free: inode exhaustion
+df -i /                      # above 90% with bytes free: inode exhaustion
 dmesg -T | tail -n 20        # "EXT4-fs error", "I/O error", "Remounting filesystem read-only": a disk fault
 findmnt -n -o OPTIONS /      # "ro," first: the kernel remounted / read-only
 systemctl is-active nginx
 curl -sS -o /dev/null -w '%{http_code}\n' http://127.0.0.1/<health-path>
-grep -E '\[(crit|alert)\].*(No space left|Read-only file system)' /var/log/nginx/error.log | tail -n 5
+tail -n 100000 /var/log/nginx/error.log | grep -E '\[(crit|alert)\].*(No space left|Read-only file system)' | tail -n 5
 ```
 
-A passing health check proves only the in-memory path; `crit` lines with errno 28 mean uploads and cache misses already fail. If the cause may be evidence, snapshot the volume first.
+A passing health check proves only the in-memory path. `crit` lines with errno 28 mean uploads and cache misses already fail; their absence proves nothing, because `error.log` sits on the full disk.
+
+- **Read-only or disk errors**: free nothing; follow the I/O fault row under Less common causes.
+- **Inodes above 90%**: go to Inode exhaustion.
+- **A possible intrusion** (an unknown file or writer): snapshot the volume first.
+- **Another node can carry the traffic**: take this one out of rotation now; its health check keeps passing. A sole load balancer keeps serving.
 
 ### Copy evidence before freeing anything
-
-`nginx -s reopen`, a truncate or a shipper restart discards a deleted-but-open file, so copy a tail of each first.
 
 ```bash
 # 1. Deleted-but-open files, with holder, inode and size
 find /proc/[0-9]*/fd -lname '*(deleted)' -printf '%p -> %l\n' 2>/dev/null
 stat -L -c 'inode %i, %s bytes' /proc/<pid>/fd/<n>
-# 2. A target off /: /dev/shm (half of RAM by default), another mount or host
-df -h /dev/shm               # a 200 MB tail per file must fit
+# 2. A target off /: another host, another mount, or /dev/shm (RAM)
+grep MemAvailable /proc/meminfo  # tails kept in /dev/shm must total well below this
+df -h /dev/shm               # half of RAM by default
 mkdir -p /dev/shm/evidence
 printf '%s pid=%s fd=%s inode=%s size=%s\n' "$(date -Is)" <pid> <n> <inode> <size> >> /dev/shm/evidence/index.txt
-# 3. A bounded tail, locally or straight off the box
-tail -c 200M /proc/<pid>/fd/<n> > /dev/shm/evidence/<pid>-<n>.tail
+# 3. A bounded tail, straight off the box or locally
 tail -c 200M /proc/<pid>/fd/<n> | ssh <user>@<collector> 'cat > /srv/evidence/<host>-<pid>-<n>.tail'
+tail -c 200M /proc/<pid>/fd/<n> > /dev/shm/evidence/<pid>-<n>.tail
 # 4. Only then release the file
 nginx -s reopen
 ```
 
-`/dev/shm` is RAM shared with NGINX and lost at reboot, so move copies off the VM within the hour.
-
-### Reclaim space that is safe to drop
-
-Free space in this order, least costly first, and check `df -h /` after each step.
-
-| # | Action | Command | Frees | Cost |
-|---|---|---|---|---|
-| 1 | Release deleted logs | `nginx -s reopen` | Deleted logs NGINX holds | None |
-| 2 | Empty a held deleted file | `: > /proc/<pid>/fd/<n>` | Its blocks | Its content |
-| 3 | Drop downloaded packages | `apt-get clean` | `/var/cache/apt/archives` | A later download |
-| 4 | Trim the journal | `journalctl --vacuum-size=500M` | Archived journals beyond 500 MB | Older system logs |
-| 5 | Remove old rotated logs | `find /var/log/nginx -name '*.gz' -mtime +2 -delete` | Logs older than two days | Local history |
-| 6 | Empty the offending live log | `tail -n 200000 /var/log/nginx/access.log > /dev/shm/evidence/access.tail`, then `truncate -s 0 /var/log/nginx/access.log` | The whole file | Its content |
-| 7 | Shrink an oversized cache | Lower `max_size` in `proxy_cache_path`, then `nginx -t && nginx -s reload` | Cache above the limit | Hit ratio; a 41 MB cache fell to 5.1 MB in 3 seconds |
-
-### Buy headroom if that is not enough
-
-- **Lend the reserve**: `tune2fs -m 1 /dev/<root-device>` frees about 2.6 GB on 64 GB at once, mounted; restore `-m 5` after the fix. A root with `Reserved block count: 0` has none to lend.
-- **Grow the volume online**: resize the volume, then `growpart /dev/<disk> <partition-number>` and `resize2fs /dev/<root-partition>`, which grow ext4 while mounted; skip the resize when `lsblk` already shows the disk larger than its partition.
+`/dev/shm` files hold RAM that NGINX needs until deleted and vanish at reboot: prefer the `ssh` stream and move local copies off the VM within the hour.
 
 ### What not to do
 
 - **`rm` on an open log**: it frees nothing while NGINX holds the descriptor, and the `nginx -s reopen` that releases it recreates the log as 0644 instead of logrotate's 0640.
 - **Clearing `/var/lib/nginx/body` or `/var/lib/nginx/proxy`**: NGINX unlinks each temp file on creation, so deleting there frees nothing.
 - **Hand-deleting under `/var/lib/dpkg`, `/var/lib/apt`, `/boot` or `/var/log/journal`**: use `apt autoremove --purge` and `journalctl --vacuum-size`.
-- **`mount -o remount,rw /` after the kernel set it read-only**: the kernel did that after an I/O or filesystem error, and new writes spread the damage; snapshot, then `fsck.ext4 -f` from a rescue boot.
+- **`mount -o remount,rw /` after the kernel set it read-only**: new writes spread the damage of the I/O or filesystem error behind it; snapshot, then `fsck.ext4 -f` from a rescue boot.
+
+### Reclaim space that is safe to drop
+
+Free space in this order, least costly first, and check `df -h /` after each step. Stop once `Avail` exceeds 5% of the filesystem, the critical alert level. If two `df -B1 --output=avail /` readings a minute apart still fall, a writer is live: run the Investigation before freeing more.
+
+| # | Action | Command | Frees | Cost |
+|---|---|---|---|---|
+| 1 | Release deleted logs | `nginx -s reopen` | Deleted logs NGINX holds | Hand-removed logs return as 0644 |
+| 2 | Drop downloaded packages | `apt-get clean` | `/var/cache/apt/archives` | A later download |
+| 3 | Trim the journal | `journalctl --vacuum-size=500M` | Archived journals beyond 500 MB | Older system logs |
+| 4 | Empty a held deleted log | `: > /proc/<pid>/fd/<n>`, for a log only, never an NGINX temp file of an in-flight request | Its blocks | Its content |
+| 5 | Remove rotated logs beyond 48 hours | Ship them, then `find /var/log/nginx -name '*.gz' -mmin +2880 -delete` | Logs beyond the target | None once shipped |
+| 6 | Empty the growing live log | `tail -n 200000 <log> > /dev/shm/evidence/<name>.tail`, then `truncate -s 0 <log>`; `<log>` is `access.log`, or `access.log.1` when NGINX never reopened | The whole file | Its content |
+| 7 | Shrink an oversized cache | Lower `max_size` in `proxy_cache_path`, then `nginx -t && nginx -s reload` | Cache above the limit | Hit ratio |
+
+### Buy headroom if that is not enough
+
+- **Lend the reserve**: `tune2fs -m 1 "$(findmnt -n -o SOURCE /)"` frees about 2.6 GB on 64 GB while mounted; restore `-m 5` after the fix. A cloud image root has none to lend.
+- **Extend the root logical volume**: when `vgs` shows `VFree`, `lvextend -r -L +10G /dev/ubuntu-vg/ubuntu-lv` grows the volume and its ext4 while mounted.
+- **Grow the volume online**: resize the volume, then `TMPDIR=/dev/shm growpart /dev/<disk> <partition-number>` (its working directory defaults to `/tmp`, on the full root) and `resize2fs /dev/<root-partition>`; on LVM, `pvresize /dev/<partition>` and `lvextend -r` replace `resize2fs`. Skip the resize when `lsblk` already shows the disk larger than its partition.
 
 ## Investigation
 
-After the first `df`, `dmesg` and mount-option commands, each check rules out a further class of causes; `diagnose-disk.sh` runs them all at idle I/O priority under timeouts and exits 1 when a collector could not run:
+Run the checks in order and stop at the first whose finding accounts for the used bytes. `diagnose-disk.sh` runs them all under timeouts, `du` and `find` at idle I/O priority, and exits 1 when a collector could not run:
 
 ```bash
 sudo ./diagnose-disk.sh / > /dev/shm/disk-report.txt
@@ -155,49 +159,48 @@ inodes above 90%?`"}
   c -- no --> d{"`**df used vs du -sx /**
 gap?`"}
   d -- yes --> e["`**Space du cannot see**
-/proc fd scan: logs not reopened, temp files, shipper buffer
-bind mount: files under a mount point`"]
+deleted-but-open files
+files under a mount point`"]
   d -- no --> f["`**du -x by directory**
-/var/log/nginx: retention, skipped rotation, logs not reopened, debug logging
-cache, temp: unbounded cache, temp files
-journal, syslog: duplicate system logs
-apt, snaps: package leftovers
-/var/crash: crash dumps
-shipper data: a stalled shipper's buffer
-any path: a stray large file`"]
-  a --> g{"`**lsblk**
-larger than partition?`"}
-  g -- yes --> grow["`**Partition never grown**`"]
+/var/log/nginx
+cache and temp paths
+journal and syslog
+apt, snaps, /var/crash
+shipper data, stray files`"]
+  a --> g{"`**lsblk, vgs**
+space outside /?`"}
+  g -- partition --> grow["`**Partition never grown**`"]
+  g -- volume group --> lv["`**Root logical volume never extended**`"]
 ```
 
-1. `lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS`: a disk larger than its partition means the partition was never grown.
-2. `du -xh --max-depth=1 / 2>/dev/null | sort -h`, then `du -xh --max-depth=2 /var 2>/dev/null | sort -h | tail -n 20`: the largest directory locates the growth.
-3. `df -B1 --output=used /; du -sxB1 / 2>/dev/null`: a gap of hundreds of MB is deleted-but-open files (logs NGINX never reopened, NGINX temp files, a shipper's buffer) or files hidden under a mount point.
-4. `find /proc/[0-9]*/fd -lname '*(deleted)' -printf '%p -> %l\n' 2>/dev/null`, or `lsof -nP +L1`: the deleted files and their holders.
-5. `find / -xdev -type f -size +500M -printf '%s\t%t\t%p\n' 2>/dev/null | sort -n` and `find / -xdev -type f -mmin -15 -size +10M -printf '%s\t%p\n' 2>/dev/null`: large files and live writers.
+1. `lsblk -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINTS; vgs`: a disk larger than its partition means the partition was never grown, and `VFree` means the root logical volume was never extended.
+2. `df -B1 --output=used /; ionice -c3 du -sxB1 / 2>/dev/null`: a gap of hundreds of MB is deleted-but-open files or files hidden under a mount point.
+3. `find /proc/[0-9]*/fd -lname '*(deleted)' -printf '%p -> %l\n' 2>/dev/null`, or `lsof -nP +L1`: the deleted files and their holders.
+4. `ionice -c3 du -xh --max-depth=1 / 2>/dev/null | sort -h`, then `ionice -c3 du -xh --max-depth=2 /var 2>/dev/null | sort -h | tail -n 20`: with no gap, the largest directory locates the growth.
+5. `ionice -c3 find / -xdev -type f -size +500M -printf '%s\t%t\t%p\n' 2>/dev/null | sort -n` and `ionice -c3 find / -xdev -type f -mmin -15 -size +10M -printf '%s\t%p\n' 2>/dev/null`: large files and live writers.
 6. `nginx -T 2>/dev/null | grep -nE 'access_log|error_log|proxy_cache_path|_temp_path|proxy_max_temp_file_size|proxy_buffering'`: `error_log ... debug` is debug logging, `proxy_cache_path` without `max_size` is an unbounded cache, and temp paths on `/` share the root disk.
 7. `ls -lhS --time-style=long-iso /var/log/nginx`: an empty `access.log` beside a large, current `access.log.1` means NGINX did not reopen after rotation; all 14 rotations present means retention outgrew the disk; none means logrotate skips NGINX.
 8. `logrotate -d /etc/logrotate.conf 2>&1 | grep -iE '^error|ignoring'; systemctl list-timers logrotate.timer; journalctl -u logrotate.service --since=-3d -p warning --no-pager; grep nginx /var/lib/logrotate/status`: an `Ignoring nginx` error, a failed run, a disabled timer or an old `nginx` entry means logrotate skips NGINX.
 9. `journalctl --disk-usage; ls -lhS /var/log | head`: a journal near its cap or a large `/var/log/syslog` means journald and rsyslog store the same logs twice.
-10. `du -sh /var/cache/apt/archives /boot /var/lib/snapd/snaps; uname -r; dpkg -l 'linux-image-[0-9]*' | grep '^ii'; snap list --all | grep disabled`: old kernels, a large apt cache or disabled snaps are upgrade leftovers.
+10. `du -sh /var/cache/apt/archives /boot /var/lib/snapd/snaps; dpkg -l 'linux-image-[0-9]*' | grep '^ii'; snap list --all | grep disabled`: old kernels, a large apt cache or disabled snaps are upgrade leftovers.
 
 ## Root causes
 
 ### Retention outgrew the disk
 
-`/etc/logrotate.d/nginx` keeps 14 daily files, two uncompressed (`delaycompress`): at 1,000 requests per second, two uncompressed days plus 12 compressed at 10:1 come to 37 + 22 = 59 GB, the whole disk.
+`/etc/logrotate.d/nginx` keeps 14 rotated files beside the live log, the newest uncompressed (`delaycompress`): at 1,000 requests per second, two uncompressed days plus 13 compressed at 10:1 come to 37 + 24 = 61 GB, the whole disk.
 
 - **Confirm**: `/var/log/nginx` largest, all 14 rotations present, a daily sawtooth.
-- **Impact**: uploads return 500, large downloads close mid-body, cache misses get an empty reply and log lines are lost, while the health check still passes.
-- **Recovery**: ship or delete the oldest `.gz` files, then lower `rotate`.
-- **Prevention**: `maxsize 1G` and `rotate 7` in `/etc/logrotate.d/nginx`, logrotate on an hourly timer, and most retention shipped off the VM.
+- **Impact**: uploads return 500, downloads truncate and cache misses get no reply, while the health check passes.
+- **Recovery**: ship, then delete the oldest `.gz` files, then lower `rotate`.
+- **Prevention**: `hourly` and `rotate 48` in `/etc/logrotate.d/nginx`, logrotate on an hourly timer, and older logs shipped off the VM.
 
 ### logrotate skips NGINX
 
 Silent failures: a group- or world-writable config file (`error: Ignoring nginx because it is writable by group or others`, yet `Result=success`), a syntax error under `/etc/logrotate.d`, or a disabled `logrotate.timer`.
 
 - **Confirm**: a steady climb; no rotated files, or an old `nginx` entry in `/var/lib/logrotate/status`.
-- **Impact**: the access log grows until uploads and cache misses fail with errno 28, while the health check still passes.
+- **Impact**: the access log grows until the disk fills.
 - **Recovery**: `chmod 0644 /etc/logrotate.d/nginx` or `systemctl enable --now logrotate.timer`, then `logrotate -v /etc/logrotate.conf`.
 - **Prevention**: alert on `error:` lines from `logrotate.service` and on the status entry's age.
 
@@ -206,9 +209,18 @@ Silent failures: a group- or world-writable config file (`error: Ignoring nginx 
 The packaged postrotate, `invoke-rc.d nginx rotate >/dev/null 2>&1`, sends `USR1` to the pid file named in `/etc/nginx/nginx.conf` and fails silently when that differs from the running master's: logrotate moves `access.log` to `.1` and creates an empty one, NGINX keeps writing to `.1`, and `.1` grows without limit while logrotate exits 0. [`tests/rotate-check.sh`](tests/rotate-check.sh) reproduces both outcomes in a container: new inodes with the packaged config, a 0-byte `access.log` without `postrotate`.
 
 - **Confirm**: `access.log` empty while `access.log.1` grows, or NGINX holds a deleted log.
-- **Impact**: `.1` grows until uploads and cache misses fail, and recent lines sit in `access.log.1` or a deleted file that a restart discards.
-- **Recovery**: copy the evidence, then `nginx -s reopen`.
-- **Prevention**: `tests/rotate-check.sh` after any unit, pid path or logrotate change; alert on deleted-but-open bytes.
+- **Impact**: `.1` grows until the disk fills, and recent lines sit in `access.log.1` or a deleted file that a restart discards.
+- **Recovery**: copy the evidence, then `kill -USR1 "$(pgrep -f '^nginx: master')"`, since `nginx -s reopen` reads the same wrong pid file; then correct that pid file.
+- **Prevention**: after a unit, pid path or logrotate change, force one rotation on the VM (`logrotate -f /etc/logrotate.d/nginx`) and check that `access.log` grows and no deleted NGINX log remains; `tests/rotate-check.sh` covers only the packaged configuration. Alert on deleted-but-open bytes.
+
+### Root logical volume never extended
+
+The Ubuntu Server installer's default layout sizes `ubuntu-lv` at half of `ubuntu-vg` for volume groups of 20 to 200 GiB, so a 64 GB VM fills a 30 GB root while about 30 GB sit unallocated.
+
+- **Confirm**: `df -h /` shows about 30 GB on a 64 GB disk; `vgs` shows about 30 GB `VFree`.
+- **Impact**: a full root at half the planned size, filling twice as fast.
+- **Recovery**: `lvextend -r -L +10G /dev/ubuntu-vg/ubuntu-lv`, online; extend further at the capacity review.
+- **Prevention**: size the root logical volume at build time; compare `vgs` with `df -h /` after each install.
 
 ### Unbounded proxy cache
 
@@ -221,7 +233,7 @@ Without `max_size` or `min_free` (NGINX 1.19.1 and later) the cache manager remo
 
 ### Temp files for uploads and downloads
 
-A body above `client_body_buffer_size` goes to `client_body_temp_path`; a response that outruns the client goes to `proxy_temp_path`, up to `proxy_max_temp_file_size` (1024 MB). NGINX unlinks these files on creation, so `du /var/lib/nginx` shows nothing while the `/proc` scan does: `/var/lib/nginx/proxy/0000000009 (deleted)` at 60 MB during one slow download.
+Large upload bodies and responses that outrun a slow client spill to `client_body_temp_path` and `proxy_temp_path`. NGINX unlinks these files on creation, so `du /var/lib/nginx` shows nothing while the `/proc` scan does: `/var/lib/nginx/proxy/0000000009 (deleted)` at 60 MB during one slow download.
 
 - **Confirm**: spikes that recover; workers hold deleted `body/` or `proxy/` files.
 - **Impact**: transient alone; near full, 500s on uploads and truncated downloads.
@@ -239,16 +251,16 @@ journald caps itself at 10% of the filesystem or 4 GB (`SystemMaxUse=`), but for
 
 ### Inode exhaustion
 
-ext4 fixes the inode count at `mkfs` time (one per 16 KB by default, about 4 million on 64 GB); millions of small files exhaust it, and creation fails with errno 28 while `df -h` shows 1% used.
+ext4 fixes the inode count at `mkfs` time (one per 16 KB by default, about 4 million on 64 GB); millions of small files exhaust it, and creation fails with errno 28 while `df -h` shows free space. It explains a 99% alert only when the monitor reports inode use.
 
 - **Confirm**: `df -i` near 100% while `df -h` shows free space.
 - **Impact**: appends continue; new temp files, cache entries and rotated logs fail.
-- **Recovery**: the directory with the most entries (`find / -xdev -printf '%h\n' | sort | uniq -c | sort -n | tail`), then remove them.
+- **Recovery**: count entries per directory without a temporary file, `find / -xdev -printf '%h\n' | awk '{ c[$0]++ } END { for (d in c) print c[d], d }' | sort -n | tail`; for the NGINX cache, lower `max_size` and reload; elsewhere, delete only files whose owner is known.
 - **Prevention**: alert on inode use; `mkfs.ext4 -i 4096` or XFS for a cache volume.
 
 ### The monitor versus `df`
 
-`df` computes `Use%` as used ÷ (used + available), excluding the reserve, so its 100% is the workers' zero; a monitor using used ÷ size reads about 5 points lower, and one without a filesystem filter may report `/boot` or a snap's squashfs, always 100%.
+`df` computes `Use%` as used ÷ (used + available), excluding the reserve, so its 100% is the workers' zero; a monitor using used ÷ size reads about 5 points lower, and one without a filesystem filter may report `/boot`, or a snap's squashfs mount, which always reads 100%.
 
 - **Confirm**: the alert's number differs from `df`, or names another mount.
 - **Impact**: none off `/`; on `/`, 99% is about 0.6 GB from errno 28.
@@ -260,13 +272,13 @@ ext4 fixes the inode count at `mkfs` time (one per 16 KB by default, about 4 mil
 | Cause | Confirm | Recover | Prevent |
 |---|---|---|---|
 | Debug error logging, about 13 KB per proxied request | `error.log` outgrows `access.log` | Level back to `error`, reload, truncate | `debug_connection <client-ip>;` for one client |
-| Apt cache, old kernels, snap revisions | `/var/cache/apt/archives`, `/boot` or `/var/lib/snapd/snaps` large after upgrades | `apt-get clean`; `apt autoremove --purge`; `snap remove <name> --revision=<rev>` | `APT::Periodic::CleanInterval "7";`, `Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";`, `refresh.retain=2` |
-| Crash dumps | `/var/crash` or a coredump directory growing | Copy one report off the VM, delete the rest, fix the crash | `MaxUse=1G` in a `coredump.conf` drop-in |
+| Apt cache, old kernels, snap revisions | `/var/cache/apt/archives`, `/boot` or `/var/lib/snapd/snaps` large after upgrades | `apt-get clean`; `apt autoremove --purge`; `snap remove <name> --revision=<rev>` | `APT::Periodic::CleanInterval "7";`, `Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";`, `snap set system refresh.retain=2` |
+| Crash dumps | `/var/crash` or `/var/lib/apport/coredump` growing; `core_pattern` names the handler | Copy one report off the VM, delete the rest, fix the crash | apport, the default: a size alert on both directories; systemd-coredump: `MaxUse=1G` in a `coredump.conf` drop-in |
 | A log shipper buffering while its destination is down | Output errors; a growing data directory | Restore the destination, or copy the evidence and restart it | A buffer limit inside a disk budget |
-| A stray large file | `find -size +500M`; `lsof <path>` shows a live writer | Stop the writer; move or delete the file after a snapshot | Ring-buffer captures (`tcpdump -C 100 -W 10`) |
+| A stray large file | `find -size +500M`; `lsof <path>` shows a live writer | Stop the writer; move the file off the VM or delete it after a snapshot | Ring-buffer captures (`tcpdump -C 100 -W 10`) |
 | Files hidden under a mount point | `df` used exceeds the `du` total with no deleted-open files | `mount --bind / /mnt/rootfs`, delete through it | Move the data before mounting over it |
 | An I/O fault or read-only remount (`errors=remount-ro`) | `EXT4-fs error` or `I/O error` in `dmesg`; `/` mounted `ro` | Stop writing, snapshot, `fsck.ext4 -f` from a rescue boot | Alert on `node_filesystem_readonly` and `node_filesystem_device_error` |
-| A root partition never grown after a resize | `lsblk` shows the disk larger than its partition | `growpart /dev/<disk> <partition-number>`, then `resize2fs /dev/<root-partition>` | Compare `lsblk` with `df -h /` after every resize |
+| A root partition never grown after a resize | `lsblk` shows the disk larger than its partition | `growpart` with `TMPDIR=/dev/shm`, then `resize2fs`, or on LVM `pvresize` and `lvextend -r` | Compare `lsblk` with `df -h /` after every resize |
 
 ## Prevention and monitoring
 
@@ -276,30 +288,34 @@ Metric names are node_exporter's; a textfile collector signal needs a small scri
 
 | Signal | Source | Alert when | Points to |
 |---|---|---|---|
-| Time to full for `/` | `predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[6h], 4 * 3600) < 0` | 15 minutes | Any live writer, hours early |
+| Time to full for `/` | `predict_linear(node_filesystem_avail_bytes{mountpoint="/"}[6h], 4 * 3600) < 0` | True for 15 minutes | Any live writer, hours early |
 | Available bytes on `/` | `node_filesystem_avail_bytes`, squashfs and tmpfs excluded | Below 15% of size (warning), 5% (critical) | Slow growth |
 | Read-only or faulting filesystem | `node_filesystem_readonly`, `node_filesystem_device_error`; `EXT4-fs error` or `I/O error` in the kernel log | Any | An I/O fault or read-only remount |
 | Inode use | `node_filesystem_files_free / node_filesystem_files` | Below 10% | Inode exhaustion |
 | Deleted-but-open bytes | Textfile collector running the `/proc` scan every 5 minutes | Above 1 GB for 30 minutes | Logs not reopened, NGINX temp files, a shipper's buffer |
-| Size of `/var/log/nginx`, the cache path, `/var/log/journal` | Textfile collector running `du -sb` | Above its budget | Retention, debug logging, an unbounded cache, the journal |
+| Size of `/var/log/nginx`, the cache path, `/var/log/journal`, `/var/crash` | Textfile collector running `du -sb` | Above its budget | Retention, debug logging, an unbounded cache, the journal, crash dumps |
 | logrotate health | `error:` lines from `logrotate.service`; age of the `nginx` status entry | Any error; older than two days | logrotate skipping NGINX or logs not reopened |
 
 ### Configuration
 
-- **Retention sized to traffic**: rotate by size as well as by day; logrotate checks `maxsize` only when it runs, so the timer goes hourly.
+- **Retention sized to traffic**: rotate hourly and keep 48 files, two days and about 5 GB at 1,000 requests per second; logrotate honours `hourly` only when its timer runs hourly.
 
 ```text
 # /etc/logrotate.d/nginx
 /var/log/nginx/*.log {
-    daily
-    maxsize 1G
-    rotate 7
+    hourly
+    rotate 48
     missingok
     compress
     delaycompress
     notifempty
     create 0640 www-data adm
     sharedscripts
+    prerotate
+        if [ -d /etc/logrotate.d/httpd-prerotate ]; then \
+            run-parts /etc/logrotate.d/httpd-prerotate; \
+        fi \
+    endscript
     postrotate
         invoke-rc.d nginx rotate >/dev/null 2>&1
     endscript
@@ -316,4 +332,4 @@ OnCalendar=hourly
 - **Log less**: `access_log off;` in the health check location.
 - **Bounded cache and temp files**: `proxy_cache_path /var/cache/nginx/app levels=1:2 keys_zone=app:50m max_size=10g min_free=5g inactive=7d use_temp_path=off;`, `proxy_max_temp_file_size 256m;`, `proxy_request_buffering off;` on upload routes.
 - **A capped journal**: `/etc/systemd/journald.conf.d/size.conf` with `[Journal]` and `SystemMaxUse=1G`, then `systemctl restart systemd-journald`.
-- **Capacity review**: monthly; grow the disk while time to full exceeds 30 days.
+- **Capacity review**: monthly; grow the disk when projected time to full falls below 30 days.

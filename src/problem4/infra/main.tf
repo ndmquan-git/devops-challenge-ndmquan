@@ -41,6 +41,10 @@ locals {
     ]
   }
 
-  ecr_repository_arn = "arn:${local.partition}:ecr:${var.aws_region}:${local.account_id}:repository/${var.ecr_repository_name}"
-  ecr_registry       = "${local.account_id}.dkr.ecr.${var.aws_region}.${data.aws_partition.current.dns_suffix}"
+  # The account that holds the repository also holds the publish role; another
+  # account's instances pull from it through the repository policy in ecr.tf.
+  holds_ecr          = var.ecr_account_id == null
+  ecr_account_id     = coalesce(var.ecr_account_id, local.account_id)
+  ecr_repository_arn = "arn:${local.partition}:ecr:${var.aws_region}:${local.ecr_account_id}:repository/${var.ecr_repository_name}"
+  ecr_registry       = "${local.ecr_account_id}.dkr.ecr.${var.aws_region}.${data.aws_partition.current.dns_suffix}"
 }

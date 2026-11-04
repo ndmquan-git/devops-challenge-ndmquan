@@ -1,6 +1,6 @@
 output "publish_role_arn" {
-  description = "Role the container workflow assumes to push images; GitHub repository variable AWS_ECR_ROLE_ARN."
-  value       = aws_iam_role.publish.arn
+  description = "Role the container workflow assumes to push images; GitHub repository variable AWS_ECR_ROLE_ARN. Null where ecr_account_id names another account."
+  value       = one(aws_iam_role.publish[*].arn)
 }
 
 output "deploy_role_arns" {
@@ -9,7 +9,7 @@ output "deploy_role_arns" {
 }
 
 output "ecr_registry" {
-  description = "Registry host for image references; GitHub repository variable ECR_REGISTRY."
+  description = "Registry host for image references, the same in every account; GitHub repository variable ECR_REGISTRY."
   value       = local.ecr_registry
 }
 
@@ -20,5 +20,5 @@ output "instance_profile_name" {
 
 output "oidc_subjects" {
   description = "Exact sub claim values each role trusts, to compare with the repository's OIDC subject settings."
-  value       = merge({ publish = [local.publish_subject] }, local.deploy_subjects)
+  value       = merge({ for k, v in { publish = [local.publish_subject] } : k => v if local.holds_ecr }, local.deploy_subjects)
 }

@@ -5,16 +5,17 @@ Terraform root module for the AWS identity side of the two pipelines in [`SOLUTI
 | Resource | Name | Trusted by | May do |
 |---|---|---|---|
 | OIDC provider | `token.actions.githubusercontent.com` | GitHub Actions | Issue `AssumeRoleWithWebIdentity` for the roles below |
-| Publish role | `<repo>-github-publish` | `main` branch running [`_container.yml`](../.github/workflows/_container.yml) | Log in to ECR; push to the one repository |
+| Publish role (the account that holds the repository) | `<repo>-github-publish` | `main` branch running [`_container.yml`](../.github/workflows/_container.yml) | Log in to ECR; push to the one repository |
 | Deploy role, per environment | `<repo>-github-deploy-<env>` | GitHub environment `<env>` running [`_deploy-ec2.yml`](../.github/workflows/_deploy-ec2.yml) or [`_deploy-s3.yml`](../.github/workflows/_deploy-s3.yml) | Drain and re-register the environment's target group; run `AWS-RunShellScript` on instances tagged `App=<app_tag>`, `Env=<env>`; upload to and read back from the frontend bucket; invalidate the distribution. Explicit deny on `iam:*`, `sts:AssumeRole`, `ec2:TerminateInstances` |
-| Instance role and profile | `<app_tag>-instance` | EC2 | `AmazonSSMManagedInstanceCore`; pull from the one repository |
+| Instance role and profile | `<app_tag>-instance` | EC2 | `AmazonSSMManagedInstanceCore`; pull from the one repository, in this account or the one `ecr_account_id` names |
 | ECR repository (optional, `create_ecr_repository`) | `<ecr_repository_name>` | | Immutable tags, scan on push |
+| ECR repository policy (when `ecr_pull_account_ids` is set) | | The `<app_tag>-instance` role of each listed account | Pull from the repository |
 
-One deploy role per environment, shared by both deploy workflows, because the workflows read a single `AWS_DEPLOY_ROLE_ARN` variable per environment and the GitHub environment (required reviewers, `main` only) is the promotion boundary. The trust policy still names both workflow files, so a job from any other workflow in the repository cannot assume the role. Splitting into an EC2 role and an S3 role would need a second variable name in the workflows.
+One deploy role per environment, shared by both deploy workflows, because the workflows read a single `AWS_DEPLOY_ROLE_ARN` variable per environment and the GitHub environment (required reviewers, `main` only) is the promotion boundary. The trust policy still names both workflow files, so only a job running one of them from `main` can assume the role, and both files hardcode the script that runs with it. Splitting into an EC2 role and an S3 role would need a second variable name in the workflows.
 
 ## Apply
 
-Requires Terraform 1.9 or newer and credentials for the target AWS account. Staging and production in separate accounts means one apply per account, with `environments` holding only the environments that live in that account.
+Requires Terraform 1.9 or newer and credentials for the target AWS account. Staging and production in separate accounts means one apply per account, with `environments` holding only the environments that live in that account. One account holds the ECR repository and the publish role; the production account is the better holder, so that production never pulls from the staging account. Its apply lists the other account in `ecr_pull_account_ids`; the other account's apply sets `ecr_account_id` to the holder and `create_ecr_repository = false`. The repository policy admits the other account's instance role by name, so both accounts keep the same `app_tag`.
 
 ```bash
 cd src/problem4/infra
@@ -33,14 +34,14 @@ gh api --method PUT "repos/<owner>/<repo>/actions/oidc/customization/sub" \
 EOF
 ```
 
-Finally set the GitHub variables listed below and attach the instance profile to the backend instances. Until the variables are set the deploy jobs run as dry runs; until the subject claim is customised, `AssumeRoleWithWebIdentity` is denied, so a mismatch fails closed.
+Finally set the GitHub variables listed below, the ECR ones before `AWS_DEPLOY_ROLE_ARN` because the instances pull only from ECR, and attach the instance profile to the backend instances. Until the variables are set the deploy jobs run as dry runs; until the subject claim is customised, `AssumeRoleWithWebIdentity` is denied, so a mismatch fails closed.
 
 ## Outputs to GitHub variables
 
 | Output or input | GitHub variable | Scope |
 |---|---|---|
-| `publish_role_arn` | `AWS_ECR_ROLE_ARN` | Repository |
-| `ecr_registry` | `ECR_REGISTRY` | Repository |
+| `publish_role_arn` (from the account that holds the repository) | `AWS_ECR_ROLE_ARN` | Repository |
+| `ecr_registry` (the same in every account) | `ECR_REGISTRY` | Repository |
 | input `aws_region` | `AWS_REGION` | Repository |
 | `deploy_role_arns["<env>"]` | `AWS_DEPLOY_ROLE_ARN` | Environment `<env>` |
 | input `environments.<env>.target_group_arn` | `TARGET_GROUP_ARN` | Environment `<env>` |
@@ -63,11 +64,11 @@ IAM evaluates only the `aud`, `sub`, `amr`, `azp`, `email` and `oaud` claims of 
 
 ## Permission notes
 
-- **Wildcard resources are limited to actions without resource-level support**: `ec2:DescribeInstances`, `elasticloadbalancing:DescribeTargetHealth`, `ssm:GetCommandInvocation`, `ssm:ListCommandInvocations` and `ecr:GetAuthorizationToken` accept only `*` (AWS Service Reference, `Resources` of each action). `DescribeTargetHealth` is what the `target-deregistered` and `target-in-service` waiters call.
+- **Wildcard resources are limited to actions without resource-level support**: `ec2:DescribeInstances`, `elasticloadbalancing:DescribeTargetHealth`, `ssm:GetCommandInvocation` and `ecr:GetAuthorizationToken` accept only `*` (AWS Service Reference, `Resources` of each action). `DescribeTargetHealth` is what the `target-deregistered` and `target-in-service` waiters call.
 - **`ssm:SendCommand` is two statements**: the `AWS-RunShellScript` document ARN without a condition, and the instance ARN with `ssm:resourceTag/App` and `ssm:resourceTag/Env`, as in the AWS example for [restricting Run Command access based on tags](https://docs.aws.amazon.com/systems-manager/latest/userguide/run-command-setting-up.html#tag-based-access). A command to an instance missing either tag is denied.
 - **The deploy role has no ECR permission**: the instances pull through the instance profile.
 - **Object reads on the bucket** (`s3:GetObject`, `s3:GetObjectVersion`, `s3:ListBucketVersions`) exist so a rollback can restore a previous `index.html` version.
-- **Cross-account pulls** (instances in one account, repository in another) need an ECR repository policy that this module does not create.
+- **Cross-account pulls** need both sides: the other account's instance role allows the pull on the holder's repository ARN, and the holder's repository policy names that role through `aws:PrincipalArn` on the account principal, which does not require the role to exist when the policy is applied.
 
 ## Checks
 

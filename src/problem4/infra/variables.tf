@@ -57,7 +57,29 @@ variable "environments" {
 }
 
 variable "create_ecr_repository" {
-  description = "Create the ECR repository (immutable tags, scan on push); set false when it already exists."
+  description = "Create the ECR repository (immutable tags, scan on push); set false when it already exists or lives in another account."
   type        = bool
   default     = true
+}
+
+variable "ecr_account_id" {
+  description = "Account that holds the ECR repository and the publish role, when that is another account; the instance role then pulls across accounts. Null when this account holds them."
+  type        = string
+  default     = null
+
+  validation {
+    condition     = var.ecr_account_id == null || (can(regex("^[0-9]{12}$", var.ecr_account_id)) && !var.create_ecr_repository)
+    error_message = "ecr_account_id must be a 12-digit account ID, with create_ecr_repository = false."
+  }
+}
+
+variable "ecr_pull_account_ids" {
+  description = "Other accounts whose <app_tag>-instance role may pull from the repository; applies in the account that holds it."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.ecr_pull_account_ids : can(regex("^[0-9]{12}$", id))]) && (length(var.ecr_pull_account_ids) == 0 || var.ecr_account_id == null)
+    error_message = "ecr_pull_account_ids takes 12-digit account IDs, and only where ecr_account_id is null."
+  }
 }
