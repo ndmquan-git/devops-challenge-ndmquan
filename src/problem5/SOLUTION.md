@@ -533,6 +533,7 @@ Costs are list prices read on 2026-11-03 and 2026-11-04, at ap-southeast-1 rates
 | Compliance targets | Business roadmap | When evidence collection must be continuous | SOC 2 within the first year; no PCI DSS scope |
 | Monthly active users | Business forecast | Sizes Cognito Plus and Bot Control costs | The baseline's 50,000 MAU |
 | KYC vendor and document storage | Compliance | Whether identity documents enter Aurora or the history archive | The vendor holds documents; Aurora stores a reference |
+| Deposit address scheme | Wallet team and treasury | KMS has no hierarchical key derivation, so a KMS key per deposit address costs $1 a month each: about $100,000 a month at 50,000 users on two chains | Not decided. Candidates: addresses derived from an extended public key and swept by an offline-held seed into the KMS-held hot wallet; a per-user memo on the account-based chain; an MPC custody provider. The cost estimate excludes deposit keys |
 | Second deposit source | Wallet team | Confirmed deposits need a second confirmation | A commercial node provider per chain, as a check beside the exchange's own nodes |
 | On-call capacity | Staffing plan | Whether a detection is acted on within minutes | None 24/7 at launch; the withdrawal policy engine and funds reconciler halt automatically |
 
